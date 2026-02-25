@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <RadioLib.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
 
 static const uint8_t PIN_NSS = 8;
 static const uint8_t PIN_SCK = 9;
@@ -88,6 +91,77 @@ StationEntry stations[STATION_CACHE_SIZE];
 PeerKeyEntry peerKeys[KEY_CACHE_SIZE];
 bool personalKeyValid = false;
 uint8_t personalKey[KEY_BYTES] = {0};
+
+BLECharacteristic *pTxChar = nullptr;
+bool bleConnected = false;
+String blePendingCmd;
+bool bleCmdReady = false;
+
+class DualPrint : public Print
+{
+    String _bleBuf;
+
+public:
+    size_t write(uint8_t c) override
+    {
+        Serial.write(c);
+        if (bleConnected && pTxChar)
+        {
+            _bleBuf += (char)c;
+            if (c == '\n')
+                flushBLE();
+        }
+        return 1;
+    }
+    size_t write(const uint8_t *buf, size_t len) override
+    {
+        Serial.write(buf, len);
+        if (bleConnected && pTxChar)
+            for (size_t i = 0; i < len; i++)
+            {
+                _bleBuf += (char)buf[i];
+                if (buf[i] == '\n')
+                    flushBLE();
+            }
+        return len;
+    }
+    void flushBLE()
+    {
+        while (_bleBuf.length() > 0)
+        {
+            size_t n = _bleBuf.length() < 200 ? _bleBuf.length() : 200;
+            pTxChar->setValue((uint8_t *)_bleBuf.c_str(), n);
+            pTxChar->notify();
+            _bleBuf = _bleBuf.substring(n);
+            delay(5);
+        }
+    }
+};
+DualPrint out;
+
+class MeshBLEServerCB : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *s) override { bleConnected = true; }
+    void onDisconnect(BLEServer *s) override
+    {
+        bleConnected = false;
+        BLEDevice::startAdvertising();
+    }
+};
+
+class MeshBLERxCB : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *c) override
+    {
+        String v = String(c->getValue().c_str());
+        v.trim();
+        if (v.length() > 0 && !bleCmdReady)
+        {
+            blePendingCmd = v;
+            bleCmdReady = true;
+        }
+    }
+};
 
 bool parseNodeValue(const String &input, uint16_t &outNode)
 {
@@ -227,7 +301,7 @@ bool deletePeerKey(uint16_t node)
 
 void printPeerKeys()
 {
-    Serial.println("Gespeicherte Node-Keys:");
+    out.println("Gespeicherte Node-Keys:");
     bool any = false;
     for (uint8_t i = 0; i < KEY_CACHE_SIZE; i++)
     {
@@ -236,14 +310,14 @@ void printPeerKeys()
             continue;
         }
         any = true;
-        Serial.print("- node=0x");
-        Serial.print(peerKeys[i].node, HEX);
-        Serial.print(" key=");
-        Serial.println(keyToHex(peerKeys[i].key));
+        out.print("- node=0x");
+        out.print(peerKeys[i].node, HEX);
+        out.print(" key=");
+        out.println(keyToHex(peerKeys[i].key));
     }
     if (!any)
     {
-        Serial.println("(keine)");
+        out.println("(keine)");
     }
 }
 
@@ -319,7 +393,7 @@ void updateStation(uint16_t node, float rssi, float snr, uint8_t hops)
 
 void printStations()
 {
-    Serial.println("Gefundene Stationen:");
+    out.println("Gefundene Stationen:");
     bool any = false;
     uint32_t nowMs = millis();
     for (uint8_t index = 0; index < STATION_CACHE_SIZE; index++)
@@ -329,21 +403,21 @@ void printStations()
             continue;
         }
         any = true;
-        Serial.print("- 0x");
-        Serial.print(stations[index].node, HEX);
-        Serial.print(" last=");
-        Serial.print((nowMs - stations[index].lastSeen) / 1000UL);
-        Serial.print("s rssi=");
-        Serial.print(stations[index].rssi);
-        Serial.print(" snr=");
-        Serial.print(stations[index].snr);
-        Serial.print(" hops=");
-        Serial.println(stations[index].hops);
+        out.print("- 0x");
+        out.print(stations[index].node, HEX);
+        out.print(" last=");
+        out.print((nowMs - stations[index].lastSeen) / 1000UL);
+        out.print("s rssi=");
+        out.print(stations[index].rssi);
+        out.print(" snr=");
+        out.print(stations[index].snr);
+        out.print(" hops=");
+        out.println(stations[index].hops);
     }
 
     if (!any)
     {
-        Serial.println("(keine)");
+        out.println("(keine)");
     }
 }
 
@@ -385,8 +459,8 @@ void restartReceive()
     int16_t state = radio.startReceive();
     if (state != RADIOLIB_ERR_NONE)
     {
-        Serial.print("RX start error: ");
-        Serial.println(state);
+        out.print("RX start error: ");
+        out.println(state);
     }
 }
 
@@ -408,8 +482,8 @@ bool sendMeshFrame(MeshHeader &header, const uint8_t *payload)
     int16_t txState = radio.transmit(frame, totalLen);
     if (txState != RADIOLIB_ERR_NONE)
     {
-        Serial.print("TX error: ");
-        Serial.println(txState);
+        out.print("TX error: ");
+        out.println(txState);
         restartReceive();
         return false;
     }
@@ -448,7 +522,7 @@ bool sendTextTo(uint16_t destination, const String &text, bool encrypted = false
     {
         if (!personalKeyValid)
         {
-            Serial.println("Kein eigener Key. Nutze: /mykey gen");
+            out.println("Kein eigener Key. Nutze: /mykey gen");
             return false;
         }
         cryptPayload(payloadBytes, header.payloadLen, personalKey, header);
@@ -462,7 +536,7 @@ void sendDiscoveryRequest()
 {
     if (sendTextTo(MESH_BROADCAST, String(CTRL_DISC_REQ)))
     {
-        Serial.println("SCAN gesendet: warte auf Antworten...");
+        out.println("SCAN gesendet: warte auf Antworten...");
     }
 }
 
@@ -472,7 +546,7 @@ void sendDiscoveryResponse(uint16_t destination)
     sendTextTo(destination, payload);
 }
 
-String buildWeatherPlaceholder()
+String weatherInfo()
 {
     float temperature = 21.5f;
     float humidity = 48.0f;
@@ -495,26 +569,26 @@ void sendWeatherRequest(uint16_t destination)
 {
     if (sendTextTo(destination, String(CTRL_WX_REQ)))
     {
-        Serial.print("WX request gesendet an ");
+        out.print("WX request gesendet an ");
         if (destination == MESH_BROADCAST)
         {
-            Serial.println("broadcast");
+            out.println("broadcast");
         }
         else
         {
-            Serial.print("0x");
-            Serial.println(destination, HEX);
+            out.print("0x");
+            out.println(destination, HEX);
         }
     }
 }
 
 void sendWeatherResponse(uint16_t destination)
 {
-    String payload = buildWeatherPlaceholder();
+    String payload = weatherInfo();
     if (sendTextTo(destination, payload))
     {
-        Serial.print("WX response gesendet an 0x");
-        Serial.println(destination, HEX);
+        out.print("WX response gesendet an 0x");
+        out.println(destination, HEX);
     }
 }
 
@@ -534,22 +608,22 @@ void sendUserMessage(const String &message)
     if (sendTextTo(MESH_BROADCAST, payloadText))
     {
         uint16_t sentMsgId = static_cast<uint16_t>(nextMsgId - 1);
-        Serial.print("TX msgId=");
-        Serial.print(sentMsgId);
-        Serial.print(" hops=");
-        Serial.print(0);
-        Serial.print("/");
-        Serial.print(configuredMaxHops);
-        Serial.print(" text=");
-        Serial.println(payloadText);
+        out.print("TX msgId=");
+        out.print(sentMsgId);
+        out.print(" hops=");
+        out.print(0);
+        out.print("/");
+        out.print(configuredMaxHops);
+        out.print(" text=");
+        out.println(payloadText);
     }
 }
 
-void sendEncryptedDirectMessage(uint16_t destination, const String &message)
+void sendCryptedDirektMassage(uint16_t destination, const String &message)
 {
     if (destination == MESH_BROADCAST)
     {
-        Serial.println("Verschluesselt nur als Direktnachricht erlaubt.");
+        out.println("Verschluesselt nur als Direktnachricht erlaubt.");
         return;
     }
 
@@ -562,12 +636,12 @@ void sendEncryptedDirectMessage(uint16_t destination, const String &message)
     if (sendTextTo(destination, payloadText, true))
     {
         uint16_t sentMsgId = static_cast<uint16_t>(nextMsgId - 1);
-        Serial.print("ETX to=0x");
-        Serial.print(destination, HEX);
-        Serial.print(" msgId=");
-        Serial.print(sentMsgId);
-        Serial.print(" text=");
-        Serial.println(payloadText);
+        out.print("ETX to=0x");
+        out.print(destination, HEX);
+        out.print(" msgId=");
+        out.print(sentMsgId);
+        out.print(" text=");
+        out.println(payloadText);
     }
 }
 
@@ -588,14 +662,14 @@ void relayIfNeeded(const MeshHeader &incoming, const uint8_t *payload, bool alre
 
     if (sendMeshFrame(relay, payload))
     {
-        Serial.print("RELAY origin=");
-        Serial.print(relay.origin, HEX);
-        Serial.print(" msgId=");
-        Serial.print(relay.msgId);
-        Serial.print(" hops=");
-        Serial.print(relay.hopCount);
-        Serial.print("/");
-        Serial.println(relay.maxHops);
+        out.print("RELAY origin=");
+        out.print(relay.origin, HEX);
+        out.print(" msgId=");
+        out.print(relay.msgId);
+        out.print(" hops=");
+        out.print(relay.hopCount);
+        out.print("/");
+        out.println(relay.maxHops);
     }
 }
 
@@ -612,8 +686,8 @@ void handleReceivedPacket()
     int16_t state = radio.readData(frame, packetLen);
     if (state != RADIOLIB_ERR_NONE)
     {
-        Serial.print("RX read error: ");
-        Serial.println(state);
+        out.print("RX error: ");
+        out.println(state);
         restartReceive();
         return;
     }
@@ -647,7 +721,7 @@ void handleReceivedPacket()
     if (header.destination == MESH_BROADCAST || header.destination == nodeId)
     {
         bool encrypted = (header.flags & MESH_FLAG_ENCRYPTED) != 0;
-        bool decryptedOk = true;
+        bool decryptedYeah = true;
         uint8_t payloadWork[MAX_MESH_PAYLOAD];
         const size_t copyLen = payloadLen <= MAX_MESH_PAYLOAD ? payloadLen : MAX_MESH_PAYLOAD;
 
@@ -657,7 +731,7 @@ void handleReceivedPacket()
             int keyIndex = findPeerKeyIndex(header.origin);
             if (keyIndex < 0)
             {
-                decryptedOk = false;
+                decryptedYeah = false;
             }
             else
             {
@@ -669,59 +743,59 @@ void handleReceivedPacket()
         memcpy(textBuffer, payloadWork, copyLen);
         textBuffer[copyLen] = '\0';
 
-        Serial.print("RX origin=");
-        Serial.print(header.origin, HEX);
-        Serial.print(" msgId=");
-        Serial.print(header.msgId);
-        Serial.print(" hops=");
-        Serial.print(header.hopCount);
-        Serial.print("/");
-        Serial.print(header.maxHops);
-        Serial.print(" rssi=");
-        Serial.print(rssi);
-        Serial.print(" snr=");
-        Serial.print(snr);
-        Serial.print(" enc=");
-        Serial.print(encrypted ? 1 : 0);
-        Serial.print(" text=");
-        if (encrypted && !decryptedOk)
+        out.print("RX origin=");
+        out.print(header.origin, HEX);
+        out.print(" msgId=");
+        out.print(header.msgId);
+        out.print(" hops=");
+        out.print(header.hopCount);
+        out.print("/");
+        out.print(header.maxHops);
+        out.print(" rssi=");
+        out.print(rssi);
+        out.print(" snr=");
+        out.print(snr);
+        out.print(" enc=");
+        out.print(encrypted ? 1 : 0);
+        out.print(" text=");
+        if (encrypted && !decryptedYeah)
         {
-            Serial.println("<encrypted: key fehlt fuer origin>");
+            out.println("<encrypted: key fehlt fuer origin>");
         }
         else
         {
-            Serial.println(textBuffer);
+            out.println(textBuffer);
         }
 
-        String payloadText = decryptedOk ? String(textBuffer) : String("");
-        if (!alreadySeen && decryptedOk && payloadText == CTRL_DISC_REQ && header.origin != nodeId)
+        String payloadText = decryptedYeah ? String(textBuffer) : String("");
+        if (!alreadySeen && decryptedYeah && payloadText == CTRL_DISC_REQ && header.origin != nodeId)
         {
             sendDiscoveryResponse(header.origin);
         }
-        else if (decryptedOk && payloadText.startsWith(String(CTRL_DISC_RESP)) && header.origin != nodeId)
+        else if (decryptedYeah && payloadText.startsWith(String(CTRL_DISC_RESP)) && header.origin != nodeId)
         {
-            Serial.print("DISCOVERED station=0x");
-            Serial.print(header.origin, HEX);
-            Serial.print(" hops=");
-            Serial.print(header.hopCount);
-            Serial.print(" rssi=");
-            Serial.print(rssi);
-            Serial.print(" snr=");
-            Serial.println(snr);
+            out.print("DISCOVERED station=0x");
+            out.print(header.origin, HEX);
+            out.print(" hops=");
+            out.print(header.hopCount);
+            out.print(" rssi=");
+            out.print(rssi);
+            out.print(" snr=");
+            out.println(snr);
         }
 
-        if (!alreadySeen && decryptedOk && payloadText == CTRL_WX_REQ && header.origin != nodeId && weatherModeEnabled)
+        if (!alreadySeen && decryptedYeah && payloadText == CTRL_WX_REQ && header.origin != nodeId && weatherModeEnabled)
         {
             sendWeatherResponse(header.origin);
         }
-        else if (decryptedOk && payloadText.startsWith(String(CTRL_WX_DATA)) && header.origin != nodeId)
+        else if (decryptedYeah && payloadText.startsWith(String(CTRL_WX_DATA)) && header.origin != nodeId)
         {
-            Serial.print("WEATHER from=0x");
-            Serial.print(header.origin, HEX);
-            Serial.print(" hops=");
-            Serial.print(header.hopCount);
-            Serial.print(" data=");
-            Serial.println(payloadText);
+            out.print("WEATHER from=0x");
+            out.print(header.origin, HEX);
+            out.print(" hops=");
+            out.print(header.hopCount);
+            out.print(" data=");
+            out.println(payloadText);
         }
     }
 
@@ -730,20 +804,21 @@ void handleReceivedPacket()
 
 void printHelp()
 {
-    Serial.println("Mesh Serial Commands:");
-    Serial.println("/help              -> Hilfe anzeigen");
-    Serial.println("/id                -> eigene Node-ID anzeigen");
-    Serial.println("/ttl <1..15>       -> maxHops setzen");
-    Serial.println("/scan              -> Stationen suchen");
-    Serial.println("/stations          -> gefundene Stationen anzeigen");
-    Serial.println("/wx on|off|status  -> Weather-Mode steuern");
-    Serial.println("/wxreq [all|node]  -> Wetterdaten anfragen");
-    Serial.println("/mykey gen|show    -> eigener Key fuer eigene Node-ID");
-    Serial.println("/key set <id> <hex32> -> Key fuer fremde Node-ID speichern");
-    Serial.println("/key del <id>      -> Key fuer Node-ID loeschen");
-    Serial.println("/keys              -> gespeicherte Keys anzeigen");
-    Serial.println("/eto <id> <text>   -> verschluesselte Direktnachricht");
-    Serial.println("jede andere Zeile  -> als Mesh-Nachricht senden");
+    out.println("Mesh Serial Commands:");
+    out.println("/help              -> Hilfe anzeigen");
+    out.println("/id                -> eigene Node-ID");
+    out.println("/ttl <1..15>       -> maxHops ");
+    out.println("/scan              -> Stationen suchen");
+    out.println("/stations          -> gefundene Stationen anzeigen");
+    out.println("/wx on|off|status  -> Weather-Mode steuern");
+    out.println("/wxreq [all|node]  -> Wetterdaten anfragen");
+    out.println("/mykey gen|show    -> eigener Key fuer eigene Node-ID");
+    out.println("/key set <id> <hex32> -> Key fuer fremde Node-ID speichern");
+    out.println("/key del <id>      -> Key fuer Node-ID loeschen");
+    out.println("/keys              -> gespeicherte Keys anzeigen");
+    out.println("/eto <id> <text>   -> verschluesselte Direktnachricht");
+    out.println("/settings          -> alle Einstellungen anzeigen (JSON)");
+    out.println("jede andere Zeile  -> als Mesh-Nachricht senden");
 }
 
 void handleSerialLine(String line)
@@ -760,10 +835,54 @@ void handleSerialLine(String line)
         return;
     }
 
+    if (line == "/settings")
+    {
+        out.print("{\"nodeId\":\"0x");
+        out.print(nodeId, HEX);
+        out.print("\",\"maxHops\":");
+        out.print(configuredMaxHops);
+        out.print(",\"weatherMode\":");
+        out.print(weatherModeEnabled ? "true" : "false");
+        out.print(",\"personalKeyValid\":");
+        out.print(personalKeyValid ? "true" : "false");
+        if (personalKeyValid)
+        {
+            out.print(",\"personalKey\":\"");
+            out.print(keyToHex(personalKey));
+            out.print("\"");
+        }
+        out.print(",\"loraFreq\":");
+        out.print(LORA_FREQUENCY);
+        out.print(",\"loraBW\":");
+        out.print(LORA_BANDWIDTH);
+        out.print(",\"loraSF\":");
+        out.print(LORA_SF);
+        out.print(",\"loraCR\":");
+        out.print(LORA_CR);
+        out.print(",\"loraPower\":");
+        out.print(LORA_POWER);
+        out.print(",\"bleConnected\":");
+        out.print(bleConnected ? "true" : "false");
+        int nKeys = 0;
+        for (uint8_t i = 0; i < KEY_CACHE_SIZE; i++)
+            if (peerKeys[i].valid)
+                nKeys++;
+        out.print(",\"peerKeys\":");
+        out.print(nKeys);
+        int nSta = 0;
+        for (uint8_t i = 0; i < STATION_CACHE_SIZE; i++)
+            if (stations[i].node)
+                nSta++;
+        out.print(",\"stations\":");
+        out.print(nSta);
+        out.println("}");
+        return;
+    }
+
     if (line == "/id")
     {
-        Serial.print("Node ID: 0x");
-        Serial.println(nodeId, HEX);
+        out.print("Node ID: 0x");
+        out.println(nodeId, HEX);
         return;
     }
 
@@ -773,12 +892,12 @@ void handleSerialLine(String line)
         if (requested >= 1 && requested <= 15)
         {
             configuredMaxHops = static_cast<uint8_t>(requested);
-            Serial.print("maxHops gesetzt auf ");
-            Serial.println(configuredMaxHops);
+            out.print("maxHops gesetzt auf ");
+            out.println(configuredMaxHops);
         }
         else
         {
-            Serial.println("Ungueltiger Wert. Erlaubt: 1..15");
+            out.println("Ungueltiger Wert. Erlaubt: 1..15");
         }
         return;
     }
@@ -798,21 +917,21 @@ void handleSerialLine(String line)
     if (line == "/wx on")
     {
         weatherModeEnabled = true;
-        Serial.println("Weather-Mode: ON");
+        out.println("Weather-Mode: ON");
         return;
     }
 
     if (line == "/wx off")
     {
         weatherModeEnabled = false;
-        Serial.println("Weather-Mode: OFF");
+        out.println("Weather-Mode: OFF");
         return;
     }
 
     if (line == "/wx status")
     {
-        Serial.print("Weather-Mode: ");
-        Serial.println(weatherModeEnabled ? "ON" : "OFF");
+        out.print("Weather-Mode: ");
+        out.println(weatherModeEnabled ? "ON" : "OFF");
         return;
     }
 
@@ -833,7 +952,7 @@ void handleSerialLine(String line)
         }
         else
         {
-            Serial.println("Ungueltiges Node-Format. Beispiel: /wxreq 0x12AF");
+            out.println("Ungueltiges Node-Format. Beispiel: /wxreq 0x12AF");
         }
         return;
     }
@@ -841,13 +960,13 @@ void handleSerialLine(String line)
     if (line == "/mykey gen")
     {
         generatePersonalKey();
-        Serial.println("Eigener Key neu generiert.");
-        Serial.print("Fuer andere Node fuer ID 0x");
-        Serial.print(nodeId, HEX);
-        Serial.print(" setzen mit: /key set 0x");
-        Serial.print(nodeId, HEX);
-        Serial.print(" ");
-        Serial.println(keyToHex(personalKey));
+        out.println("Eigener Key neu generiert.");
+        out.print("Fuer andere Node fuer ID 0x");
+        out.print(nodeId, HEX);
+        out.print(" setzen mit: /key set 0x");
+        out.print(nodeId, HEX);
+        out.print(" ");
+        out.println(keyToHex(personalKey));
         return;
     }
 
@@ -855,14 +974,14 @@ void handleSerialLine(String line)
     {
         if (!personalKeyValid)
         {
-            Serial.println("Kein eigener Key gesetzt. Nutze: /mykey gen");
+            out.println("Kein eigener Key gesetzt. Nutze: /mykey gen");
         }
         else
         {
-            Serial.print("Eigener Key fuer ID 0x");
-            Serial.print(nodeId, HEX);
-            Serial.print(": ");
-            Serial.println(keyToHex(personalKey));
+            out.print("Eigener Key fuer ID 0x");
+            out.print(nodeId, HEX);
+            out.print(": ");
+            out.println(keyToHex(personalKey));
         }
         return;
     }
@@ -880,7 +999,7 @@ void handleSerialLine(String line)
         int split = rest.indexOf(' ');
         if (split <= 0)
         {
-            Serial.println("Syntax: /key set <nodeId> <hex32>");
+            out.println("Syntax: /key set <nodeId> <hex32>");
             return;
         }
 
@@ -893,23 +1012,23 @@ void handleSerialLine(String line)
         uint8_t parsedKey[KEY_BYTES];
         if (!parseNodeValue(nodeToken, keyNode))
         {
-            Serial.println("Ungueltige Node-ID.");
+            out.println("Ungueltige Node-ID.");
             return;
         }
         if (!parseHexKey(keyToken, parsedKey))
         {
-            Serial.println("Ungueltiger Key. Erwartet 32 Hex-Zeichen.");
+            out.println("Ungueltiger Key. Erwartet 32 Hex-Zeichen.");
             return;
         }
 
         if (!setPeerKey(keyNode, parsedKey))
         {
-            Serial.println("Key-Speicher voll.");
+            out.println("Key-Speicher voll.");
             return;
         }
 
-        Serial.print("Key gespeichert fuer Node 0x");
-        Serial.println(keyNode, HEX);
+        out.print("Key gespeichert fuer Node 0x");
+        out.println(keyNode, HEX);
         return;
     }
 
@@ -920,18 +1039,18 @@ void handleSerialLine(String line)
         nodeToken.trim();
         if (!parseNodeValue(nodeToken, keyNode))
         {
-            Serial.println("Ungueltige Node-ID.");
+            out.println("Ungueltige Node-ID.");
             return;
         }
 
         if (deletePeerKey(keyNode))
         {
-            Serial.print("Key geloescht fuer Node 0x");
-            Serial.println(keyNode, HEX);
+            out.print("Key geloescht fuer Node 0x");
+            out.println(keyNode, HEX);
         }
         else
         {
-            Serial.println("Kein Key fuer diese Node vorhanden.");
+            out.println("Kein Key fuer diese Node vorhanden.");
         }
         return;
     }
@@ -943,7 +1062,7 @@ void handleSerialLine(String line)
         int split = rest.indexOf(' ');
         if (split <= 0)
         {
-            Serial.println("Syntax: /eto <nodeId> <text>");
+            out.println("Syntax: /eto <nodeId> <text>");
             return;
         }
 
@@ -955,11 +1074,11 @@ void handleSerialLine(String line)
         uint16_t targetNode = 0;
         if (!parseNodeValue(nodeToken, targetNode))
         {
-            Serial.println("Ungueltige Node-ID.");
+            out.println("Ungueltige Node-ID.");
             return;
         }
 
-        sendEncryptedDirectMessage(targetNode, textToken);
+        sendCryptedDirektMassage(targetNode, textToken);
         return;
     }
 
@@ -1014,8 +1133,8 @@ void setup()
 
     if (state != RADIOLIB_ERR_NONE)
     {
-        Serial.print("LoRa init Fehler: ");
-        Serial.println(state);
+        out.print("LoRa init Fehler: ");
+        out.println(state);
         while (true)
         {
             delay(1000);
@@ -1026,31 +1145,49 @@ void setup()
 
     restartReceive();
 
-    Serial.println("Mesh gestartet ");
-    Serial.print("Node ID: 0x");
-    Serial.println(nodeId, HEX);
-    Serial.println("Weather-Mode: OFF");
-    Serial.println("Encryption: /mykey gen fuer eigenen Node-Key");
-    Serial.print("Pins NSS/SCK/MOSI/MISO/RST/BUSY/DIO1: ");
-    Serial.print(PIN_NSS);
-    Serial.print("/");
-    Serial.print(PIN_SCK);
-    Serial.print("/");
-    Serial.print(PIN_MOSI);
-    Serial.print("/");
-    Serial.print(PIN_MISO);
-    Serial.print("/");
-    Serial.print(PIN_RST);
-    Serial.print("/");
-    Serial.print(PIN_BUSY);
-    Serial.print("/");
-    Serial.println(PIN_DIO1);
+    BLEDevice::init("MegaMesh");
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MeshBLEServerCB());
+    BLEService *pSvc = pServer->createService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    pTxChar = pSvc->createCharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLECharacteristic::PROPERTY_NOTIFY);
+    pTxChar->addDescriptor(new BLE2902());
+    BLECharacteristic *pRxChar = pSvc->createCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E", BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    pRxChar->setCallbacks(new MeshBLERxCB());
+    pSvc->start();
+    BLEDevice::startAdvertising();
+
+    out.println("Mesh gestartet ");
+    out.print("Node ID: 0x");
+    out.println(nodeId, HEX);
+    out.println("Weather-Mode: OFF");
+    out.println("Encryption: /mykey gen for eigenen Node-Key");
+    out.println("BLE: MegaMesh (NUS)");
+    out.print("Pins NSS/SCK/MOSI/MISO/RST/BUSY/DIO1: ");
+    out.print(PIN_NSS);
+    out.print("/");
+    out.print(PIN_SCK);
+    out.print("/");
+    out.print(PIN_MOSI);
+    out.print("/");
+    out.print(PIN_MISO);
+    out.print("/");
+    out.print(PIN_RST);
+    out.print("/");
+    out.print(PIN_BUSY);
+    out.print("/");
+    out.println(PIN_DIO1);
     printHelp();
 }
 
 void loop()
 {
     readSerialInput();
+
+    if (bleCmdReady)
+    {
+        handleSerialLine(blePendingCmd);
+        bleCmdReady = false;
+    }
 
     if (radioIrq)
     {
