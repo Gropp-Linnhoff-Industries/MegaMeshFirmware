@@ -1,3 +1,31 @@
+/////////////////////////////////////////////////////////////////////////////////
+// This code is primaraly designed for educational purpose as a school Projekt    //
+// ------------------------------------------------------------------------------ //
+// The current configuration is optimised for Heltec Lora 32 v3(3.2)              //
+// ------------------------------------------------------------------------------ //
+// Authers:                                                                       //
+// Flavius Linnhoff   @https://github.com/Flavours64                              //
+// Benedict Gropp     @https://github.com/Benemaster                              //
+// ------------------------------------------------------------------------------ //
+// Project Name: MegaMesh                                                         //
+// GitHub Projekt Page:                                                           //
+// GitHub Web Client:                                                             //
+// ------------------------------------------------------------------------------ //
+// Basic explenation of the project:                                              //
+//                                                                                //
+// This project trys to create a indipendent scaleble meshcommunication network   //
+// for weather data and many other data types. Key features are security and      //
+// scalebility. It supports multiple options for useres to use and interact with  //
+// this firmware via spezific hardware or with every Chrome or Edge Browser or    //
+// an AndroidApp.                                                                 //
+//                                                                                //
+// ------------------------------------------------------------------------------ //
+// !!! This is only a small part of the project and it will not be easy to use    //
+// !!! setup. There is no setup instruction or dokumentation avalible.            //
+//                                                                                //
+////////////////////////////////////////////////////////////////////////////////////
+
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <RadioLib.h>
@@ -161,7 +189,7 @@ class MeshBLERxCB : public BLECharacteristicCallbacks
             bleCmdReady = true;
         }
     }
-};
+};   //
 
 bool parseNodeValue(const String &input, uint16_t &outNode)
 {
