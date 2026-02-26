@@ -25,14 +25,15 @@
 //                                                                                //
 ////////////////////////////////////////////////////////////////////////////////////
 
-#include <mbedtls/aes.h>
-#include <Arduino.h>
-#include <SPI.h>
-#include <RadioLib.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
+#include <mbedtls/aes.h> // AES library for encryption
+#include <Arduino.h>     // Main Arduino library
+#include <SPI.h>         // SPI library for communication with the LoRa module
+#include <RadioLib.h>    // RadioLib library for LoRa communication
+#include <BLEDevice.h>   // BLE library for Bluetooth communication
+#include <BLEServer.h>   // BLE server library for handling Bluetooth server functionality
+#include <BLE2902.h>     // BLE descriptor library for handling Bluetooth descriptors
 
+// Pin definitions for the LoRa module
 static const uint8_t PIN_NSS = 8;
 static const uint8_t PIN_SCK = 9;
 static const uint8_t PIN_MOSI = 10;
@@ -41,6 +42,7 @@ static const uint8_t PIN_RST = 12;
 static const uint8_t PIN_BUSY = 13;
 static const uint8_t PIN_DIO1 = 14;
 
+// LoRa configuration parameters
 static const float LORA_FREQUENCY = 868.0;
 static const float LORA_BANDWIDTH = 125.0;
 static const uint8_t LORA_SF = 9;
@@ -50,6 +52,7 @@ static const int8_t LORA_POWER = 17;
 static const uint16_t LORA_PREAMBLE = 8;
 static const float LORA_TCXO_VOLTAGE = 1.6;
 
+// Mesh network configuration parameters
 static const uint16_t MESH_MAGIC = 0x4D48;
 static const uint8_t MESH_VERSION = 1;
 static const uint16_t MESH_BROADCAST = 0xFFFF;
@@ -66,6 +69,7 @@ static const char *CTRL_DISC_RESP = "#MESH_DISC_RESP";
 static const char *CTRL_WX_REQ = "#MESH_WX_REQ";
 static const char *CTRL_WX_DATA = "#MESH_WX_DATA";
 
+// Data structures for mesh network management
 struct SeenEntry
 {
     uint16_t origin;
@@ -73,6 +77,7 @@ struct SeenEntry
     uint32_t seenAt;
 };
 
+// Data structure for storing information about stations in the mesh network
 struct StationEntry
 {
     uint16_t node;
@@ -82,6 +87,7 @@ struct StationEntry
     uint8_t hops;
 };
 
+// Data structure for storing peer keys for encryption
 struct PeerKeyEntry
 {
     bool valid;
@@ -89,6 +95,7 @@ struct PeerKeyEntry
     uint8_t key[KEY_BYTES];
 };
 
+// Data structure for the mesh packet header
 #pragma pack(push, 1)
 struct MeshHeader
 {
@@ -104,9 +111,11 @@ struct MeshHeader
 };
 #pragma pack(pop)
 
+// RadioLib instance for the LoRa module
 Module radioModule(PIN_NSS, PIN_DIO1, PIN_RST, PIN_BUSY);
 SX1262 radio(&radioModule);
 
+// Global variables for managing the mesh network state
 volatile bool radioIrq = false;
 uint16_t nodeId = 0;
 uint16_t nextMsgId = 1;
@@ -120,11 +129,13 @@ PeerKeyEntry peerKeys[KEY_CACHE_SIZE];
 bool personalKeyValid = false;
 uint8_t personalKey[KEY_BYTES] = {0};
 
+// Bluetooth characteristic
 BLECharacteristic *pTxChar = nullptr;
 bool bleConnected = false;
 String blePendingCmd;
 bool bleCmdReady = false;
 
+// dual output class for serial and BLE for shorter code and better readability
 class DualPrint : public Print
 {
     String _bleBuf;
@@ -189,7 +200,7 @@ class MeshBLERxCB : public BLECharacteristicCallbacks
             bleCmdReady = true;
         }
     }
-};   //
+}; //
 
 bool parseNodeValue(const String &input, uint16_t &outNode)
 {
@@ -359,14 +370,14 @@ void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHea
     mbedtls_aes_setkey_enc(&aes, key, 128);
 
     uint8_t iv[16] = {0};
-    
+
     iv[0] = (header.origin >> 8) & 0xFF;
     iv[1] = header.origin & 0xFF;
     iv[2] = (header.destination >> 8) & 0xFF;
     iv[3] = header.destination & 0xFF;
     iv[4] = (header.msgId >> 8) & 0xFF;
     iv[5] = header.msgId & 0xFF;
-    
+
     // Variables for mbedtls
     size_t nc_off = 0;
     uint8_t stream_block[16] = {0};
@@ -374,10 +385,9 @@ void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHea
     // CTR mode
     mbedtls_aes_crypt_ctr(&aes, len, &nc_off, iv, stream_block, buffer, buffer);
 
-    //clean to prevent memory leaks
+    // clean to prevent memory leaks
     mbedtls_aes_free(&aes);
 }
-
 
 int findStationIndex(uint16_t node)
 {
