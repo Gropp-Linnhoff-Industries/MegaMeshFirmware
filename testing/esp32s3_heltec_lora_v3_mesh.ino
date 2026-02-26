@@ -1,4 +1,4 @@
-/////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////
 // This code is primaraly designed for educational purpose as a school Projekt    //
 // ------------------------------------------------------------------------------ //
 // The current configuration is optimised for Heltec Lora 32 v3(3.2)              //
@@ -25,7 +25,7 @@
 //                                                                                //
 ////////////////////////////////////////////////////////////////////////////////////
 
-
+#include <mbedtls/aes.h>
 #include <Arduino.h>
 #include <SPI.h>
 #include <RadioLib.h>
@@ -351,26 +351,33 @@ void printPeerKeys()
 
 void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHeader &header)
 {
-    uint32_t state = 2166136261UL;
-    state ^= header.origin;
-    state *= 16777619UL;
-    state ^= (static_cast<uint32_t>(header.destination) << 16) | header.msgId;
-    state *= 16777619UL;
+    // Initialize the AES context
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
 
-    for (uint8_t i = 0; i < KEY_BYTES; i++)
-    {
-        state ^= key[i];
-        state *= 16777619UL;
-    }
+    // AES key setup (128)
+    mbedtls_aes_setkey_enc(&aes, key, 128);
 
-    for (size_t i = 0; i < len; i++)
-    {
-        state ^= static_cast<uint32_t>(i + 1);
-        state = state * 1664525UL + 1013904223UL;
-        uint8_t ks = static_cast<uint8_t>(state >> 24);
-        buffer[i] ^= ks;
-    }
+    uint8_t iv[16] = {0};
+    
+    iv[0] = (header.origin >> 8) & 0xFF;
+    iv[1] = header.origin & 0xFF;
+    iv[2] = (header.destination >> 8) & 0xFF;
+    iv[3] = header.destination & 0xFF;
+    iv[4] = (header.msgId >> 8) & 0xFF;
+    iv[5] = header.msgId & 0xFF;
+    
+    // Variables for mbedtls
+    size_t nc_off = 0;
+    uint8_t stream_block[16] = {0};
+
+    // CTR mode
+    mbedtls_aes_crypt_ctr(&aes, len, &nc_off, iv, stream_block, buffer, buffer);
+
+    //clean to prevent memory leaks
+    mbedtls_aes_free(&aes);
 }
+
 
 int findStationIndex(uint16_t node)
 {
