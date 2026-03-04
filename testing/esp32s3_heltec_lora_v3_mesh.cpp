@@ -32,6 +32,8 @@
 #include <BLEDevice.h>   // BLE library for Bluetooth communication
 #include <BLEServer.h>   // BLE server library for handling Bluetooth server functionality
 #include <BLE2902.h>     // BLE descriptor library for handling Bluetooth descriptors
+#include <esp_sleep.h>   // ESP32 sleep modes
+#include <driver/gpio.h> // GPIO wakeup for light sleep
 
 // Pin definitions for the LoRa module
 static const uint8_t PIN_NSS = 8;
@@ -42,13 +44,17 @@ static const uint8_t PIN_RST = 12;
 static const uint8_t PIN_BUSY = 13;
 static const uint8_t PIN_DIO1 = 14;
 
+// Battery monitoring pins (Heltec V3)
+static const uint8_t PIN_VBAT_ADC = 1;  // Battery voltage ADC (GPIO1)
+static const uint8_t PIN_ADC_CTRL = 37; // ADC enable – LOW to activate divider
+
 // LoRa configuration parameters
 static const float LORA_FREQUENCY = 868.0;
 static const float LORA_BANDWIDTH = 125.0;
 static const uint8_t LORA_SF = 9;
 static const uint8_t LORA_CR = 7;
 static const uint8_t LORA_SYNC_WORD = 0x12;
-static const int8_t LORA_POWER = 17;
+static int8_t loraPower = 17; // mutable for runtime adjustment
 static const uint16_t LORA_PREAMBLE = 8;
 static const float LORA_TCXO_VOLTAGE = 1.6;
 
@@ -64,10 +70,24 @@ static const uint8_t STATION_CACHE_SIZE = 32;
 static const uint8_t KEY_CACHE_SIZE = 24;
 static const uint8_t KEY_BYTES = 16;
 static const uint8_t MESH_FLAG_ENCRYPTED = 0x01;
+
+// Default public channel key
+// channel works out of the box 32 hex = 16 bytes
+static const uint8_t PUBLIC_KEY[KEY_BYTES] = {
+    0x4D, 0x45, 0x47, 0x41, 0x4D, 0x45, 0x53, 0x48,
+    0x50, 0x55, 0x42, 0x4C, 0x49, 0x43, 0x30, 0x31}; // "MEGAMESHPUBLIC01"
 static const char *CTRL_DISC_REQ = "#MESH_DISC_REQ";
 static const char *CTRL_DISC_RESP = "#MESH_DISC_RESP";
 static const char *CTRL_WX_REQ = "#MESH_WX_REQ";
 static const char *CTRL_WX_DATA = "#MESH_WX_DATA";
+static const char *CTRL_ACK = "#MESH_ACK";
+static const char *CTRL_TRACE_REQ = "#MESH_TRACE_REQ";
+static const char *CTRL_TRACE_RESP = "#MESH_TRACE_RESP";
+
+// Reliable send configuration
+static const uint8_t OUTBOUND_BUFFER_SIZE = 8;
+static const uint8_t MAX_RETRIES = 10;
+static const uint32_t RETRY_INTERVAL_MS = 5000;
 
 // Data structures for mesh network management
 struct SeenEntry
@@ -111,7 +131,17 @@ struct MeshHeader
 };
 #pragma pack(pop)
 
-// RadioLib instance for the LoRa module
+// Data structure for outbound message buffer (reliable send)
+struct OutboundEntry
+{
+    bool active;
+    MeshHeader header;
+    uint8_t payload[MAX_MESH_PAYLOAD];
+    uint8_t retries;
+    uint32_t lastSentAt;
+};
+
+// RadioLib setup for the LoRa module
 Module radioModule(PIN_NSS, PIN_DIO1, PIN_RST, PIN_BUSY);
 SX1262 radio(&radioModule);
 
@@ -129,13 +159,48 @@ PeerKeyEntry peerKeys[KEY_CACHE_SIZE];
 bool personalKeyValid = false;
 uint8_t personalKey[KEY_BYTES] = {0};
 
+// Reliable send buffer
+OutboundEntry outboundBuffer[OUTBOUND_BUFFER_SIZE];
+bool reliableSendEnabled = true;
+
+// Sleep mode configuration
+bool sleepModeEnabled = false;
+static const uint64_t SLEEP_MAINTENANCE_US = 5000000ULL; // 5 s timer wakeup for retries/maintenance
+static const uint32_t SLEEP_IDLE_MS = 200;               // idle time before entering sleep
+
+// Weather station location
+float wxLatitude = 0.0;
+float wxLongitude = 0.0;
+bool wxLocationSet = false;
+
 // Bluetooth characteristic
 BLECharacteristic *pTxChar = nullptr;
 bool bleConnected = false;
-String blePendingCmd;
-bool bleCmdReady = false;
 
-// dual output class for serial and BLE for shorter code and better readability
+// BLE command ring buffer
+#define BLE_CMD_QUEUE_SIZE 16
+String bleCmdQueue[BLE_CMD_QUEUE_SIZE];
+volatile uint8_t bleCmdHead = 0;
+volatile uint8_t bleCmdTail = 0;
+
+// Offline inbox: store up to 10 messages addressed to this node while BLE is disconnected
+#define INBOX_SIZE 10
+struct InboxEntry
+{
+    bool used;
+    uint16_t origin;
+    uint16_t msgId;
+    uint8_t hops;
+    uint8_t maxHops;
+    float rssi;
+    float snr;
+    bool encrypted;
+    char text[MAX_MESH_PAYLOAD + 1];
+};
+InboxEntry inbox[INBOX_SIZE];
+uint8_t inboxWritePos = 0;
+
+// dual output class for serial and BLE for shorter code
 class DualPrint : public Print
 {
     String _bleBuf;
@@ -178,9 +243,65 @@ public:
 };
 DualPrint out;
 
+// Store a received directed message in the offline inbox
+void storeInbox(uint16_t origin, uint16_t msgId, uint8_t hops, uint8_t maxH,
+                float rssi, float snr, bool enc, const char *text)
+{
+    InboxEntry &e = inbox[inboxWritePos];
+    e.used = true;
+    e.origin = origin;
+    e.msgId = msgId;
+    e.hops = hops;
+    e.maxHops = maxH;
+    e.rssi = rssi;
+    e.snr = snr;
+    e.encrypted = enc;
+    strncpy(e.text, text, MAX_MESH_PAYLOAD);
+    e.text[MAX_MESH_PAYLOAD] = '\0';
+    inboxWritePos = (inboxWritePos + 1) % INBOX_SIZE;
+}
+
+// Flush all stored inbox messages over BLE
+void flushInbox()
+{
+    for (uint8_t i = 0; i < INBOX_SIZE; i++)
+    {
+        if (!inbox[i].used)
+            continue;
+        InboxEntry &e = inbox[i];
+        out.print("RX origin=");
+        out.print(e.origin, HEX);
+        out.print(" dest=0x");
+        out.print(nodeId, HEX);
+        out.print(" msgId=");
+        out.print(e.msgId);
+        out.print(" hops=");
+        out.print(e.hops);
+        out.print("/");
+        out.print(e.maxHops);
+        out.print(" rssi=");
+        out.print(e.rssi);
+        out.print(" snr=");
+        out.print(e.snr);
+        out.print(" enc=");
+        out.print(e.encrypted ? 1 : 0);
+        out.print(" text=");
+        out.println(e.text);
+        e.used = false;
+        delay(20); // small gap between messages
+    }
+}
+
+// Flag to flush inbox on next loop iteration (set from BLE callback)
+volatile bool pendingInboxFlush = false;
+
 class MeshBLEServerCB : public BLEServerCallbacks
 {
-    void onConnect(BLEServer *s) override { bleConnected = true; }
+    void onConnect(BLEServer *s) override
+    {
+        bleConnected = true;
+        pendingInboxFlush = true; // schedule flush for next loop()
+    }
     void onDisconnect(BLEServer *s) override
     {
         bleConnected = false;
@@ -194,13 +315,17 @@ class MeshBLERxCB : public BLECharacteristicCallbacks
     {
         String v = String(c->getValue().c_str());
         v.trim();
-        if (v.length() > 0 && !bleCmdReady)
+        if (v.length() > 0)
         {
-            blePendingCmd = v;
-            bleCmdReady = true;
+            uint8_t nextHead = (bleCmdHead + 1) % BLE_CMD_QUEUE_SIZE;
+            if (nextHead != bleCmdTail) // queue not full
+            {
+                bleCmdQueue[bleCmdHead] = v;
+                bleCmdHead = nextHead;
+            }
         }
     }
-}; //
+};
 
 bool parseNodeValue(const String &input, uint16_t &outNode)
 {
@@ -358,6 +483,53 @@ void printPeerKeys()
     {
         out.println("(keine)");
     }
+}
+
+// ── Battery voltage helpers (Heltec V3) ─────────────────────────────
+
+float readBatteryVoltage()
+{
+    pinMode(PIN_ADC_CTRL, OUTPUT);
+    digitalWrite(PIN_ADC_CTRL, LOW); // enable voltage divider
+    delay(10);
+    uint32_t raw = analogReadMilliVolts(PIN_VBAT_ADC);
+    digitalWrite(PIN_ADC_CTRL, HIGH); // disable to save power
+    // Heltec V3 uses a 390k/390k divider → factor ≈ 2.0
+    float voltage = raw * 2.0f / 1000.0f;
+    return voltage;
+}
+
+uint8_t batteryPercent(float voltage)
+{
+    // LiPo approximation: 4.2V = 100%, 3.0V = 0%
+    if (voltage >= 4.2f)
+        return 100;
+    if (voltage <= 3.0f)
+        return 0;
+    return static_cast<uint8_t>((voltage - 3.0f) / 1.2f * 100.0f);
+}
+
+void printBatteryInfo()
+{
+    float v = readBatteryVoltage();
+    uint8_t pct = batteryPercent(v);
+    out.print("Battery: ");
+    out.print(v, 2);
+    out.print("V (");
+    out.print(pct);
+    out.println("%)");
+}
+
+// ── Light-sleep helpers (DIO1 wakeup) ────────────────────────────────
+
+void enterLightSleep()
+{
+    // Wake on DIO1 HIGH (LoRa packet received)
+    gpio_wakeup_enable(static_cast<gpio_num_t>(PIN_DIO1), GPIO_INTR_HIGH_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+    // Also wake on timer for maintenance (retry buffer, serial, etc.)
+    esp_sleep_enable_timer_wakeup(SLEEP_MAINTENANCE_US);
+    esp_light_sleep_start();
 }
 
 void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHeader &header)
@@ -537,7 +709,142 @@ bool sendMeshFrame(MeshHeader &header, const uint8_t *payload)
     return true;
 }
 
-bool sendTextTo(uint16_t destination, const String &text, bool encrypted = false)
+// Outgoing message buffer management for reliable send(optoional feature)
+int findFreeOutboundSlot()
+{
+    for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+    {
+        if (!outboundBuffer[i].active)
+            return i;
+    }
+    return -1;
+}
+
+bool bufferOutboundMessage(const MeshHeader &hdr, const uint8_t *payload)
+{
+    int slot = findFreeOutboundSlot();
+    if (slot < 0)
+    {
+        out.println("Outbound buffer full message sent without ACK tracking.");
+        return false;
+    }
+    outboundBuffer[slot].active = true;
+    outboundBuffer[slot].header = hdr;
+    memcpy(outboundBuffer[slot].payload, payload, hdr.payloadLen);
+    outboundBuffer[slot].retries = 0;
+    outboundBuffer[slot].lastSentAt = millis();
+    return true;
+}
+
+void removeOutboundByMsgId(uint16_t origin, uint16_t msgId)
+{
+    for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+    {
+        if (outboundBuffer[i].active &&
+            outboundBuffer[i].header.origin == origin &&
+            outboundBuffer[i].header.msgId == msgId)
+        {
+            outboundBuffer[i].active = false;
+            out.print("ACK received msgId=");
+            out.print(msgId);
+            out.println(" removed from buffer.");
+            return;
+        }
+    }
+}
+
+void processOutboundBuffer()
+{
+    if (!reliableSendEnabled)
+        return;
+
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+    {
+        if (!outboundBuffer[i].active)
+            continue;
+
+        if (now - outboundBuffer[i].lastSentAt < RETRY_INTERVAL_MS)
+            continue;
+
+        outboundBuffer[i].retries++;
+        if (outboundBuffer[i].retries > MAX_RETRIES)
+        {
+            out.print("FAILED msgId=");
+            out.print(outboundBuffer[i].header.msgId);
+            out.print(" to=0x");
+            out.print(outboundBuffer[i].header.destination, HEX);
+            out.println(" – no ACK after 10 retries, dropped.");
+            outboundBuffer[i].active = false;
+            continue;
+        }
+
+        out.print("RETRY #");
+        out.print(outboundBuffer[i].retries);
+        out.print(" msgId=");
+        out.print(outboundBuffer[i].header.msgId);
+        out.print(" to=0x");
+        out.println(outboundBuffer[i].header.destination, HEX);
+
+        sendMeshFrame(outboundBuffer[i].header, outboundBuffer[i].payload);
+        outboundBuffer[i].lastSentAt = now;
+    }
+}
+
+void printOutboundBuffer()
+{
+    out.println("Outbound buffer:");
+    bool any = false;
+    for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+    {
+        if (!outboundBuffer[i].active)
+            continue;
+        any = true;
+        out.print("- msgId=");
+        out.print(outboundBuffer[i].header.msgId);
+        out.print(" to=0x");
+        out.print(outboundBuffer[i].header.destination, HEX);
+        out.print(" retries=");
+        out.print(outboundBuffer[i].retries);
+        out.print("/");
+        out.println(MAX_RETRIES);
+    }
+    if (!any)
+        out.println("(empty)");
+}
+
+// Forward declaration
+bool sendTextTo(uint16_t destination, const String &text, bool encrypted = false);
+
+// ACK helper
+
+void sendAck(uint16_t destination, uint16_t ackedOrigin, uint16_t ackedMsgId)
+{
+    String payload = String(CTRL_ACK) + ":" +
+                     String(ackedOrigin, HEX) + ":" +
+                     String(ackedMsgId);
+    sendTextTo(destination, payload);
+}
+
+// Trace route helpers
+
+void sendTraceRoute(uint16_t destination)
+{
+    if (destination == MESH_BROADCAST)
+    {
+        out.println("Traceroute requires a specific node ID.");
+        return;
+    }
+    // Payload: "#MESH_TRACE_REQ:0xOrigin"
+    String payload = String(CTRL_TRACE_REQ) + ":0x" + String(nodeId, HEX);
+    if (sendTextTo(destination, payload))
+    {
+        out.print("TRACEROUTE sent to 0x");
+        out.println(destination, HEX);
+    }
+}
+
+bool sendTextTo(uint16_t destination, const String &text, bool encrypted)
 {
     if (text.length() == 0)
     {
@@ -574,7 +881,17 @@ bool sendTextTo(uint16_t destination, const String &text, bool encrypted = false
     }
 
     rememberSeen(header.origin, header.msgId);
-    return sendMeshFrame(header, payloadBytes);
+    bool sent = sendMeshFrame(header, payloadBytes);
+
+    // Buffer for reliable delivery if enabled, directed, and not a control/ACK message
+    if (sent && reliableSendEnabled &&
+        destination != MESH_BROADCAST &&
+        !payloadText.startsWith("#MESH_"))
+    {
+        bufferOutboundMessage(header, payloadBytes);
+    }
+
+    return sent;
 }
 
 void sendDiscoveryRequest()
@@ -606,7 +923,13 @@ String weatherInfo()
     payload += String(humidity, 1);
     payload += ",hPa=";
     payload += String(pressure, 1);
-    payload += ",placeholder=1";
+    if (wxLocationSet)
+    {
+        payload += ",lat=";
+        payload += String(wxLatitude, 6);
+        payload += ",lon=";
+        payload += String(wxLongitude, 6);
+    }
     return payload;
 }
 
@@ -664,6 +987,31 @@ void sendUserMessage(const String &message)
     }
 }
 
+void sendDirectMessage(uint16_t destination, const String &message)
+{
+    if (message.length() == 0)
+    {
+        return;
+    }
+
+    String payloadText = message;
+    if (payloadText.length() > MAX_MESH_PAYLOAD)
+    {
+        payloadText = payloadText.substring(0, MAX_MESH_PAYLOAD);
+    }
+
+    if (sendTextTo(destination, payloadText, false))
+    {
+        uint16_t sentMsgId = static_cast<uint16_t>(nextMsgId - 1);
+        out.print("TX to=0x");
+        out.print(destination, HEX);
+        out.print(" msgId=");
+        out.print(sentMsgId);
+        out.print(" text=");
+        out.println(payloadText);
+    }
+}
+
 void sendCryptedDirektMassage(uint16_t destination, const String &message)
 {
     if (destination == MESH_BROADCAST)
@@ -690,7 +1038,48 @@ void sendCryptedDirektMassage(uint16_t destination, const String &message)
     }
 }
 
-void relayIfNeeded(const MeshHeader &incoming, const uint8_t *payload, bool alreadySeen)
+void sendPublicMessage(const String &message)
+{
+    if (message.length() == 0)
+    {
+        return;
+    }
+
+    String payloadText = message;
+    if (payloadText.length() > MAX_MESH_PAYLOAD)
+    {
+        payloadText = payloadText.substring(0, MAX_MESH_PAYLOAD);
+    }
+
+    MeshHeader header;
+    header.magic = MESH_MAGIC;
+    header.version = MESH_VERSION;
+    header.origin = nodeId;
+    header.msgId = nextMsgId++;
+    header.destination = MESH_BROADCAST;
+    header.hopCount = 0;
+    header.maxHops = configuredMaxHops;
+    header.flags = MESH_FLAG_ENCRYPTED;
+    header.payloadLen = static_cast<uint8_t>(payloadText.length());
+
+    uint8_t payloadBytes[MAX_MESH_PAYLOAD];
+    memcpy(payloadBytes, payloadText.c_str(), header.payloadLen);
+    cryptPayload(payloadBytes, header.payloadLen, PUBLIC_KEY, header);
+
+    rememberSeen(header.origin, header.msgId);
+    if (sendMeshFrame(header, payloadBytes))
+    {
+        uint16_t sentMsgId = static_cast<uint16_t>(nextMsgId - 1);
+        out.print("TX msgId=");
+        out.print(sentMsgId);
+        out.print(" hops=0/");
+        out.print(configuredMaxHops);
+        out.print(" enc=pub text=");
+        out.println(payloadText);
+    }
+}
+
+void relayIfNeeded(const MeshHeader &incoming, const uint8_t *payload, bool alreadySeen, const char *decodedText = nullptr)
 {
     if (alreadySeen)
     {
@@ -704,6 +1093,33 @@ void relayIfNeeded(const MeshHeader &incoming, const uint8_t *payload, bool alre
     MeshHeader relay = incoming;
     relay.hopCount = incoming.hopCount + 1;
     rememberSeen(relay.origin, relay.msgId);
+
+    // Special handling: append our node ID to trace route requests before relaying
+    if (decodedText != nullptr)
+    {
+        String txt(decodedText);
+        if (txt.startsWith(String(CTRL_TRACE_REQ)))
+        {
+            // Append our nodeId to the route path
+            String newPayload = txt + ">0x" + String(nodeId, HEX);
+            if (newPayload.length() <= MAX_MESH_PAYLOAD)
+            {
+                relay.payloadLen = static_cast<uint8_t>(newPayload.length());
+                uint8_t modifiedPayload[MAX_MESH_PAYLOAD];
+                memcpy(modifiedPayload, newPayload.c_str(), relay.payloadLen);
+                if (sendMeshFrame(relay, modifiedPayload))
+                {
+                    out.print("RELAY TRACE origin=");
+                    out.print(relay.origin, HEX);
+                    out.print(" hops=");
+                    out.print(relay.hopCount);
+                    out.print("/");
+                    out.println(relay.maxHops);
+                }
+                return;
+            }
+        }
+    }
 
     if (sendMeshFrame(relay, payload))
     {
@@ -763,24 +1179,34 @@ void handleReceivedPacket()
         updateStation(header.origin, rssi, snr, header.hopCount);
     }
 
+    // Decode payload outside the destination check so relay can use it for trace route
+    bool decryptedYeah = true;
+    char textBuffer[MAX_MESH_PAYLOAD + 1];
+    textBuffer[0] = '\0';
+    const size_t copyLen = payloadLen <= MAX_MESH_PAYLOAD ? payloadLen : MAX_MESH_PAYLOAD;
+
     if (header.destination == MESH_BROADCAST || header.destination == nodeId)
     {
         bool encrypted = (header.flags & MESH_FLAG_ENCRYPTED) != 0;
-        bool decryptedYeah = true;
         uint8_t payloadWork[MAX_MESH_PAYLOAD];
-        const size_t copyLen = payloadLen <= MAX_MESH_PAYLOAD ? payloadLen : MAX_MESH_PAYLOAD;
 
         memcpy(payloadWork, payloadPtr, copyLen);
         if (encrypted)
         {
             int keyIndex = findPeerKeyIndex(header.origin);
-            if (keyIndex < 0)
+            if (keyIndex >= 0)
             {
-                decryptedYeah = false;
+                // Decrypt with stored peer key
+                cryptPayload(payloadWork, copyLen, peerKeys[keyIndex].key, header);
+            }
+            else if (header.destination == MESH_BROADCAST)
+            {
+                // Broadcast without peer key — try public key
+                cryptPayload(payloadWork, copyLen, PUBLIC_KEY, header);
             }
             else
             {
-                cryptPayload(payloadWork, copyLen, peerKeys[keyIndex].key, header);
+                decryptedYeah = false;
             }
         }
 
@@ -790,6 +1216,14 @@ void handleReceivedPacket()
 
         out.print("RX origin=");
         out.print(header.origin, HEX);
+        out.print(" dest=");
+        if (header.destination == MESH_BROADCAST)
+            out.print("broadcast");
+        else
+        {
+            out.print("0x");
+            out.print(header.destination, HEX);
+        }
         out.print(" msgId=");
         out.print(header.msgId);
         out.print(" hops=");
@@ -813,6 +1247,51 @@ void handleReceivedPacket()
         }
 
         String payloadText = decryptedYeah ? String(textBuffer) : String("");
+
+        // ── Handle ACK messages ──────────────────────────────────────
+        if (decryptedYeah && payloadText.startsWith(String(CTRL_ACK)) && header.destination == nodeId)
+        {
+            // Format: #MESH_ACK:<originHex>:<msgId>
+            int firstColon = payloadText.indexOf(':', String(CTRL_ACK).length());
+            if (firstColon > 0)
+            {
+                int secondColon = payloadText.indexOf(':', firstColon + 1);
+                if (secondColon > 0)
+                {
+                    String originStr = payloadText.substring(firstColon + 1, secondColon);
+                    String msgIdStr = payloadText.substring(secondColon + 1);
+                    uint16_t ackedOrigin = static_cast<uint16_t>(strtoul(originStr.c_str(), nullptr, 16));
+                    uint16_t ackedMsgId = static_cast<uint16_t>(msgIdStr.toInt());
+                    removeOutboundByMsgId(ackedOrigin, ackedMsgId);
+                }
+            }
+        }
+
+        // ── Handle trace route request (we are the destination) ──────
+        if (!alreadySeen && decryptedYeah && payloadText.startsWith(String(CTRL_TRACE_REQ)) && header.destination == nodeId && header.origin != nodeId)
+        {
+            // Append ourselves and send back as TRACE_RESP
+            String route = payloadText.substring(String(CTRL_TRACE_REQ).length() + 1); // skip ':'
+            route += ">0x" + String(nodeId, HEX);
+            String respPayload = String(CTRL_TRACE_RESP) + ":" + route;
+            sendTextTo(header.origin, respPayload);
+            out.print("TRACEROUTE arrived from 0x");
+            out.print(header.origin, HEX);
+            out.print(" route=");
+            out.println(route);
+        }
+
+        // ── Handle trace route response (we are the origin) ─────────
+        if (decryptedYeah && payloadText.startsWith(String(CTRL_TRACE_RESP)) && header.destination == nodeId)
+        {
+            String route = payloadText.substring(String(CTRL_TRACE_RESP).length() + 1);
+            out.print("TRACEROUTE to 0x");
+            out.print(header.origin, HEX);
+            out.print(": ");
+            out.println(route);
+        }
+
+        // ── Handle discovery ─────────────────────────────────────────
         if (!alreadySeen && decryptedYeah && payloadText == CTRL_DISC_REQ && header.origin != nodeId)
         {
             sendDiscoveryResponse(header.origin);
@@ -829,6 +1308,7 @@ void handleReceivedPacket()
             out.println(snr);
         }
 
+        // Handle weather
         if (!alreadySeen && decryptedYeah && payloadText == CTRL_WX_REQ && header.origin != nodeId && weatherModeEnabled)
         {
             sendWeatherResponse(header.origin);
@@ -842,9 +1322,37 @@ void handleReceivedPacket()
             out.print(" data=");
             out.println(payloadText);
         }
+
+        // Auto-ACK for directed non-control user messages
+        if (!alreadySeen && decryptedYeah && header.destination == nodeId &&
+            header.origin != nodeId && !payloadText.startsWith("#MESH_"))
+        {
+            sendAck(header.origin, header.origin, header.msgId);
+            // Store in offline inbox if BLE is not connected
+            if (!bleConnected)
+            {
+                bool encrypted = (header.flags & MESH_FLAG_ENCRYPTED) != 0;
+                storeInbox(header.origin, header.msgId, header.hopCount,
+                           header.maxHops, rssi, snr, encrypted, textBuffer);
+            }
+        }
+    }
+    else
+    {
+        // packet not for this node but logging and potential relay
+        bool encrypted = (header.flags & MESH_FLAG_ENCRYPTED) != 0;
+        if (!encrypted)
+        {
+            memcpy(textBuffer, payloadPtr, copyLen);
+            textBuffer[copyLen] = '\0';
+        }
+        else
+        {
+            decryptedYeah = false;
+        }
     }
 
-    relayIfNeeded(header, payloadPtr, alreadySeen);
+    relayIfNeeded(header, payloadPtr, alreadySeen, decryptedYeah ? textBuffer : nullptr);
 }
 
 void printHelp()
@@ -855,13 +1363,23 @@ void printHelp()
     out.println("/ttl <1..15>       -> maxHops ");
     out.println("/scan              -> Stationen suchen");
     out.println("/stations          -> gefundene Stationen anzeigen");
+    out.println("/msg <id> <text>   -> Direktnachricht (unverschluesselt)");
     out.println("/wx on|off|status  -> Weather-Mode steuern");
     out.println("/wxreq [all|node]  -> Wetterdaten anfragen");
-    out.println("/mykey gen|show    -> eigener Key fuer eigene Node-ID");
+    out.println("/wxloc <lat> <lon> -> Standort fuer Weather-Mode setzen");
+    out.println("/wxloc show        -> aktuellen Standort anzeigen");
+    out.println("/mykey gen|show|set-> eigener Key fuer eigene Node-ID");
     out.println("/key set <id> <hex32> -> Key fuer fremde Node-ID speichern");
     out.println("/key del <id>      -> Key fuer Node-ID loeschen");
     out.println("/keys              -> gespeicherte Keys anzeigen");
     out.println("/eto <id> <text>   -> verschluesselte Direktnachricht");
+    out.println("/pub <text>        -> oeffentliche Nachricht (Public Key)");
+    out.println("/traceroute <id>   -> Route zu einer Node anzeigen");
+    out.println("/reliable on|off|status -> Zuverlaessiges Senden ein/aus");
+    out.println("/buffer            -> Outbound-Buffer anzeigen");
+    out.println("/battery           -> Batteriespannung anzeigen");
+    out.println("/txpower <2..22>   -> TX Power in dBm setzen");
+    out.println("/sleep on|off|status -> Schlafmodus (DIO1 wakeup)");
     out.println("/settings          -> alle Einstellungen anzeigen (JSON)");
     out.println("jede andere Zeile  -> als Mesh-Nachricht senden");
 }
@@ -880,8 +1398,10 @@ void handleSerialLine(String line)
         return;
     }
 
+    // settings dump for externals and console
     if (line == "/settings")
     {
+
         out.print("{\"nodeId\":\"0x");
         out.print(nodeId, HEX);
         out.print("\",\"maxHops\":");
@@ -905,7 +1425,7 @@ void handleSerialLine(String line)
         out.print(",\"loraCR\":");
         out.print(LORA_CR);
         out.print(",\"loraPower\":");
-        out.print(LORA_POWER);
+        out.print(loraPower);
         out.print(",\"bleConnected\":");
         out.print(bleConnected ? "true" : "false");
         int nKeys = 0;
@@ -920,6 +1440,21 @@ void handleSerialLine(String line)
                 nSta++;
         out.print(",\"stations\":");
         out.print(nSta);
+        out.print(",\"reliableSend\":");
+        out.print(reliableSendEnabled ? "true" : "false");
+        int nBuf = 0;
+        for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+            if (outboundBuffer[i].active)
+                nBuf++;
+        out.print(",\"outboundBuffered\":");
+        out.print(nBuf);
+        out.print(",\"sleepMode\":");
+        out.print(sleepModeEnabled ? "true" : "false");
+        float batV = readBatteryVoltage();
+        out.print(",\"batteryV\":");
+        out.print(batV, 2);
+        out.print(",\"batteryPct\":");
+        out.print(batteryPercent(batV));
         out.println("}");
         return;
     }
@@ -943,6 +1478,24 @@ void handleSerialLine(String line)
         else
         {
             out.println("Ungueltiger Wert. Erlaubt: 1..15");
+        }
+        return;
+    }
+
+    if (line.startsWith("/txpower "))
+    {
+        int requested = line.substring(9).toInt();
+        if (requested >= 2 && requested <= 22)
+        {
+            loraPower = static_cast<int8_t>(requested);
+            radio.setOutputPower(loraPower);
+            out.print("TX Power gesetzt auf ");
+            out.print(loraPower);
+            out.println(" dBm");
+        }
+        else
+        {
+            out.println("Ungueltiger Wert. Erlaubt: 2..22");
         }
         return;
     }
@@ -1006,6 +1559,29 @@ void handleSerialLine(String line)
     {
         generatePersonalKey();
         out.println("Eigener Key neu generiert.");
+        out.print("Fuer andere Node fuer ID 0x");
+        out.print(nodeId, HEX);
+        out.print(" setzen mit: /key set 0x");
+        out.print(nodeId, HEX);
+        out.print(" ");
+        out.println(keyToHex(personalKey));
+        return;
+    }
+
+    if (line.startsWith("/mykey set "))
+    {
+        String keyToken = line.substring(11);
+        keyToken.trim();
+        uint8_t parsedKey[KEY_BYTES];
+        if (!parseHexKey(keyToken, parsedKey))
+        {
+            out.println("Ungueltiger Key. Erwartet 32 Hex-Zeichen.");
+            return;
+        }
+        memcpy(personalKey, parsedKey, KEY_BYTES);
+        personalKeyValid = true;
+        out.print("Eigener Key gesetzt: ");
+        out.println(keyToHex(personalKey));
         out.print("Fuer andere Node fuer ID 0x");
         out.print(nodeId, HEX);
         out.print(" setzen mit: /key set 0x");
@@ -1100,6 +1676,46 @@ void handleSerialLine(String line)
         return;
     }
 
+    if (line.startsWith("/msg "))
+    {
+        String rest = line.substring(5);
+        rest.trim();
+        int split = rest.indexOf(' ');
+        if (split <= 0)
+        {
+            out.println("Syntax: /msg <nodeId> <text>");
+            return;
+        }
+
+        String nodeToken = rest.substring(0, split);
+        String textToken = rest.substring(split + 1);
+        nodeToken.trim();
+        textToken.trim();
+
+        uint16_t targetNode = 0;
+        if (!parseNodeValue(nodeToken, targetNode))
+        {
+            out.println("Ungueltige Node-ID.");
+            return;
+        }
+
+        sendDirectMessage(targetNode, textToken);
+        return;
+    }
+
+    if (line.startsWith("/pub "))
+    {
+        String text = line.substring(5);
+        text.trim();
+        if (text.length() == 0)
+        {
+            out.println("Syntax: /pub <text>");
+            return;
+        }
+        sendPublicMessage(text);
+        return;
+    }
+
     if (line.startsWith("/eto "))
     {
         String rest = line.substring(5);
@@ -1124,6 +1740,126 @@ void handleSerialLine(String line)
         }
 
         sendCryptedDirektMassage(targetNode, textToken);
+        return;
+    }
+
+    if (line.startsWith("/wxloc "))
+    {
+        String rest = line.substring(7);
+        rest.trim();
+
+        if (rest == "show")
+        {
+            if (wxLocationSet)
+            {
+                out.print("WX Location: lat=");
+                out.print(wxLatitude, 6);
+                out.print(" lon=");
+                out.println(wxLongitude, 6);
+            }
+            else
+            {
+                out.println("Kein Standort gesetzt. Nutze: /wxloc <lat> <lon>");
+            }
+            return;
+        }
+
+        int split = rest.indexOf(' ');
+        if (split <= 0)
+        {
+            out.println("Syntax: /wxloc <lat> <lon> oder /wxloc show");
+            return;
+        }
+
+        String latToken = rest.substring(0, split);
+        String lonToken = rest.substring(split + 1);
+        latToken.trim();
+        lonToken.trim();
+
+        wxLatitude = latToken.toFloat();
+        wxLongitude = lonToken.toFloat();
+        wxLocationSet = true;
+
+        out.print("WX Location gesetzt: lat=");
+        out.print(wxLatitude, 6);
+        out.print(" lon=");
+        out.println(wxLongitude, 6);
+        return;
+    }
+
+    // Traceroute command
+    if (line.startsWith("/traceroute "))
+    {
+        String nodeToken = line.substring(12);
+        nodeToken.trim();
+        uint16_t targetNode = 0;
+        if (!parseNodeValue(nodeToken, targetNode))
+        {
+            out.println("Ungueltige Node-ID. Beispiel: /traceroute 0x12AF");
+            return;
+        }
+        sendTraceRoute(targetNode);
+        return;
+    }
+
+    // Reliable send toggle
+    if (line == "/reliable on")
+    {
+        reliableSendEnabled = true;
+        out.println("Reliable send: ON");
+        return;
+    }
+
+    if (line == "/reliable off")
+    {
+        reliableSendEnabled = false;
+        // Clear buffer when off
+        for (uint8_t i = 0; i < OUTBOUND_BUFFER_SIZE; i++)
+            outboundBuffer[i].active = false;
+        out.println("Reliable send: OFF (buffer cleared)");
+        return;
+    }
+
+    if (line == "/reliable status")
+    {
+        out.print("Reliable send: ");
+        out.println(reliableSendEnabled ? "ON" : "OFF");
+        return;
+    }
+
+    // Show outbound buffer
+    if (line == "/buffer")
+    {
+        printOutboundBuffer();
+        return;
+    }
+
+    // Battery command
+    if (line == "/battery")
+    {
+        printBatteryInfo();
+        return;
+    }
+
+    // Sleep mode toggle
+    if (line == "/sleep on")
+    {
+        sleepModeEnabled = true;
+        out.println("Sleep mode: ON (light-sleep with DIO1 wakeup)");
+        return;
+    }
+
+    if (line == "/sleep off")
+    {
+        sleepModeEnabled = false;
+        out.println("Sleep mode: OFF");
+        return;
+    }
+
+    if (line == "/sleep status")
+    {
+        out.print("Sleep mode: ");
+        out.println(sleepModeEnabled ? "ON" : "OFF");
         return;
     }
 
@@ -1171,7 +1907,7 @@ void setup()
         LORA_SF,
         LORA_CR,
         LORA_SYNC_WORD,
-        LORA_POWER,
+        loraPower,
         LORA_PREAMBLE,
         LORA_TCXO_VOLTAGE,
         false);
@@ -1190,6 +1926,7 @@ void setup()
 
     restartReceive();
 
+    // BLE setup
     BLEDevice::init("MegaMesh");
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MeshBLEServerCB());
@@ -1201,12 +1938,16 @@ void setup()
     pSvc->start();
     BLEDevice::startAdvertising();
 
+    // print info at startup
     out.println("Mesh gestartet ");
     out.print("Node ID: 0x");
     out.println(nodeId, HEX);
     out.println("Weather-Mode: OFF");
     out.println("Encryption: /mykey gen for eigenen Node-Key");
     out.println("BLE: MegaMesh (NUS)");
+    out.print("Sleep mode: ");
+    out.println(sleepModeEnabled ? "ON" : "OFF");
+    printBatteryInfo();
     out.print("Pins NSS/SCK/MOSI/MISO/RST/BUSY/DIO1: ");
     out.print(PIN_NSS);
     out.print("/");
@@ -1228,15 +1969,39 @@ void loop()
 {
     readSerialInput();
 
-    if (bleCmdReady)
+    // Process all queued BLE commands
+    while (bleCmdHead != bleCmdTail)
     {
-        handleSerialLine(blePendingCmd);
-        bleCmdReady = false;
+        String cmd = bleCmdQueue[bleCmdTail];
+        bleCmdTail = (bleCmdTail + 1) % BLE_CMD_QUEUE_SIZE;
+        handleSerialLine(cmd);
+    }
+
+    // Flush offline inbox when BLE just connected
+    if (pendingInboxFlush && bleConnected)
+    {
+        pendingInboxFlush = false;
+        delay(800); // let BLE stabilize (MTU negotiation etc.)
+        flushInbox();
     }
 
     if (radioIrq)
     {
         radioIrq = false;
         handleReceivedPacket();
+    }
+
+    // Process outbound retry buffer
+    processOutboundBuffer();
+
+    // Enter light sleep if enabled and nothing pending
+    if (sleepModeEnabled && !radioIrq && !Serial.available() && bleCmdHead == bleCmdTail)
+    {
+        delay(SLEEP_IDLE_MS); // small guard so serial chars can arrive
+        if (!radioIrq && !Serial.available() && bleCmdHead == bleCmdTail)
+        {
+            enterLightSleep();
+            // startingpoint wakeup
+        }
     }
 }
