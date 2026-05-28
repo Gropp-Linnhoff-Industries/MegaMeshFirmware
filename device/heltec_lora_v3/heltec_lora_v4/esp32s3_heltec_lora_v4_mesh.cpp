@@ -1,29 +1,27 @@
 ////////////////////////////////////////////////////////////////////////////////////
-// This code is primaraly designed for educational purpose as a school Projekt    //
+// This code is primarily designed for educational purposes as a school project.  //
 // ------------------------------------------------------------------------------ //
-// The current configuration is optimised for Heltec Lora 32 v4(4.0)              //
+// The current configuration is optimized for Heltec LoRa 32 v4 (4.0).            //
 // ------------------------------------------------------------------------------ //
-// Authers:                                                                       //
-// Flavius Linnhoff   @https://github.com/Flavours64                              //
-// Benedict Gropp     @https://github.com/Benemaster                              //
+// Authors:                                                                       //
+// Flavius Linnhoff    @https://github.com/Flavours64                             //
+// Benedict Gropp      @https://github.com/Benemaster                             //
 // ------------------------------------------------------------------------------ //
 // Project Name: MegaMesh                                                         //
-// GitHub Projekt Page:                                                           //
-// GitHub Web Client:                                                             //
 // ------------------------------------------------------------------------------ //
-// Inspiration and code snippets taken from Meshtastic project by various authors //
+// Inspiration and code snippets taken from the Meshtastic project.               //
 // ------------------------------------------------------------------------------ //
-// Basic explenation of the project:                                              //
+// Project Overview:                                                              //
 //                                                                                //
-// This project trys to create a indipendent scaleble meshcommunication network   //
-// for weather data and many other data types. Key features are security and      //
-// scalebility. It supports multiple options for useres to use and interact with  //
-// this firmware via spezific hardware or with every Chrome or Edge Browser or    //
-// an AndroidApp.                                                                 //
+// This project aims to create an independent, scalable mesh communication        //
+// network for weather data and various other data types. Key features include    //
+// security and scalability. It supports multiple interfaces for user             //
+// interaction, including specific hardware, Chromium-based browsers,             //
+// and a dedicated Android application.                                           //
 //                                                                                //
 // ------------------------------------------------------------------------------ //
-// !!! This is only a small part of the project and it will not be easy to use    //
-// !!! setup. There is no setup instruction or dokumentation avalible.            //
+// !!! This is only a subset of the project; setup may be complex.                //
+// !!! No official setup instructions or documentation are currently available.   //
 //                                                                                //
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -37,9 +35,24 @@
 #include <Preferences.h>    // NVS flash storage for persistent settings
 #include <esp_sleep.h>      // ESP32 sleep modes
 #include <driver/rtc_io.h>  // GPIO wakeup for light sleep
+#include <Wire.h>           // I2C bus for display and BMP280
 #include "HT_SSD1306Wire.h" // OLED display library (Heltec)
 
-// Keep these visible before any auto-generated prototypes in Arduino sketch builds.
+#if __has_include(<DHT.h>)
+#include <DHT.h>
+#define HAS_DHT22_LIB 1
+#else
+#define HAS_DHT22_LIB 0
+#endif
+
+#if __has_include(<Adafruit_BMP280.h>)
+#include <Adafruit_BMP280.h>
+#define HAS_BMP280_LIB 1
+#else
+#define HAS_BMP280_LIB 0
+#endif
+
+// for Arduino compiler
 struct MeshHeader;
 struct PersistentSettings;
 
@@ -55,6 +68,13 @@ static const uint8_t PIN_DIO1 = 14;
 // Pin for oled display
 static const uint8_t PIN_SDA = 17;
 static const uint8_t PIN_SCL = 18;
+
+// Weather sensor pins (adjust DHT11 pin to your wiring)
+static const uint8_t PIN_DHT22 = 45;
+static const uint8_t PIN_BMP_SDA = 20;
+static const uint8_t PIN_BMP_SCL = 21;
+static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
+static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
 
 // Battery monitoring pins (Heltec V4)
 static const uint8_t PIN_VBAT_ADC = 1;
@@ -212,6 +232,27 @@ static const uint32_t OUTBOUND_PROCESS_INTERVAL_MS = 25; // run retry maintenanc
 float wxLatitude = 0.0; // i love Gleitkommazahlen und das ist irgendwo im meer
 float wxLongitude = 0.0;
 bool wxLocationSet = false;
+
+// Weather sensor runtime state
+bool dht22Ready = false;
+bool bmp280Ready = false;
+float lastTempC = NAN;
+float lastHumidity = NAN;
+float lastPressureHpa = NAN;
+uint32_t lastWxReadAt = 0;
+static const uint32_t WX_READ_INTERVAL_MS = 2500;
+static const float WX_PLACEHOLDER_VALUE = -999.0f;
+
+#if HAS_DHT22_LIB
+DHT dht22(PIN_DHT22, DHT11);
+#endif
+
+#if HAS_BMP280_LIB
+Adafruit_BMP280 bmp280;
+#endif
+
+// Dedicated I2C bus for BMP280 on pins 20/21 (separate from OLED).
+TwoWire bmpWire(1);
 
 // Bluetooth characteristic
 BLECharacteristic *pTxChar = nullptr;
@@ -853,6 +894,76 @@ void enterLightSleep()
     rtc_gpio_wakeup_disable(static_cast<gpio_num_t>(PIN_DIO1));
 }
 
+void initWeatherSensors()
+{
+#if HAS_DHT22_LIB
+    dht22.begin();
+    dht22Ready = true;
+#else
+    dht22Ready = false;
+    out.println("[WX] DHT library missing. Install DHT sensor library.");
+#endif
+
+#if HAS_BMP280_LIB
+    bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
+    if (bmp280.begin(BMP280_ADDR_PRIMARY, &bmpWire) || bmp280.begin(BMP280_ADDR_SECONDARY, &bmpWire))
+    {
+        bmp280Ready = true;
+    }
+    else
+    {
+        bmp280Ready = false;
+        out.println("[WX] BMP280 not found at 0x76/0x77 on pins 20/21.");
+    }
+#else
+    bmp280Ready = false;
+    out.println("[WX] BMP280 library missing. Install Adafruit BMP280 library.");
+#endif
+}
+
+void updateWeatherReadings(bool force = false)
+{
+    const uint32_t nowMs = millis();
+    if (!force && nowMs - lastWxReadAt < WX_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastWxReadAt = nowMs;
+
+#if HAS_DHT22_LIB
+    if (dht22Ready)
+    {
+        float dhtTemp = dht22.readTemperature();
+        float dhtHum = dht22.readHumidity();
+        if (!isnan(dhtTemp))
+        {
+            lastTempC = dhtTemp;
+        }
+        if (!isnan(dhtHum))
+        {
+            lastHumidity = dhtHum;
+        }
+    }
+#endif
+
+#if HAS_BMP280_LIB
+    if (bmp280Ready)
+    {
+        float bmpTemp = bmp280.readTemperature();
+        float bmpPress = bmp280.readPressure() / 100.0f;
+        if (isnan(lastTempC) && !isnan(bmpTemp))
+        {
+            // If DHT temperature is not available, use BMP280 as fallback.
+            lastTempC = bmpTemp;
+        }
+        if (!isnan(bmpPress))
+        {
+            lastPressureHpa = bmpPress;
+        }
+    }
+#endif
+}
+
 void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHeader &header)
 {
     // Initialize the AES context
@@ -1329,9 +1440,15 @@ void sendDiscoveryResponse(uint16_t requester)
 
 String weatherInfo()
 {
-    float temperature = 21.5f;
-    float humidity = 48.0f;
-    float pressure = 1012.8f;
+    updateWeatherReadings();
+
+    const bool tempValid = !isnan(lastTempC);
+    const bool humValid = !isnan(lastHumidity);
+    const bool pressureValid = !isnan(lastPressureHpa);
+
+    float temperature = tempValid ? lastTempC : WX_PLACEHOLDER_VALUE;
+    float humidity = humValid ? lastHumidity : WX_PLACEHOLDER_VALUE;
+    float pressure = pressureValid ? lastPressureHpa : WX_PLACEHOLDER_VALUE;
 
     String payload = String(CTRL_WX_DATA);
     payload += ":node=0x";
@@ -1342,6 +1459,12 @@ String weatherInfo()
     payload += String(humidity, 1);
     payload += ",hPa=";
     payload += String(pressure, 1);
+    payload += ",tempOk=";
+    payload += tempValid ? "1" : "0";
+    payload += ",humOk=";
+    payload += humValid ? "1" : "0";
+    payload += ",pressOk=";
+    payload += pressureValid ? "1" : "0";
     if (wxLocationSet)
     {
         payload += ",lat=";
@@ -1375,6 +1498,13 @@ void sendWeatherResponse(uint16_t destination)
     if (sendTextTo(destination, payload))
     {
         out.print("WX response gesendet an 0x");
+        out.println(destination, HEX);
+        out.print("WX payload: ");
+        out.println(payload);
+    }
+    else
+    {
+        out.print("WX response FEHLER an 0x");
         out.println(destination, HEX);
     }
 }
@@ -1663,7 +1793,6 @@ void handleReceivedPacket()
             }
         }
 
-        char textBuffer[MAX_MESH_PAYLOAD + 1];
         memcpy(textBuffer, payloadWork, copyLen);
         textBuffer[copyLen] = '\0';
 
@@ -1774,7 +1903,14 @@ void handleReceivedPacket()
         // Handle weather
         if (!alreadySeen && decryptedYeah && payloadText == CTRL_WX_REQ && header.origin != nodeId && weatherModeEnabled)
         {
+            out.print("WX request empfangen von 0x");
+            out.println(header.origin, HEX);
             sendWeatherResponse(header.origin);
+        }
+        else if (!alreadySeen && decryptedYeah && payloadText == CTRL_WX_REQ && header.origin != nodeId && !weatherModeEnabled)
+        {
+            out.print("WX request ignoriert (Weather-Mode OFF) von 0x");
+            out.println(header.origin, HEX);
         }
         else if (decryptedYeah && payloadText.startsWith(String(CTRL_WX_DATA)) && header.origin != nodeId)
         {
@@ -1866,6 +2002,7 @@ void printHelp()
     out.println(F("/battery           -> Batteriespannung anzeigen"));
     out.println(F("/txpower <2..22>   -> SX1262 Chip-Power (GC1109 PA verstaerkt non-linear)"));
     out.println(F("/sleep on|off|status -> Schlafmodus (DIO1 wakeup)"));
+    out.println(F("/bmptest           -> BMP280 Sensor testen (Temp/Druck/Hoehe)"));
     out.println(F("/save              -> Einstellungen sofort auf Flash speichern"));
     out.println(F("/settings          -> alle Einstellungen anzeigen (JSON)"));
     out.println(F("/imgstart <id> <meta> -> Bild-Header senden (App-intern)"));
@@ -2400,6 +2537,49 @@ void handleSerialLine(String line)
         return;
     }
 
+    // BMP280 sensor test
+    if (line == "/bmptest")
+    {
+#if HAS_BMP280_LIB
+        if (!bmp280Ready)
+        {
+            out.println("[BMP280] Sensor nicht bereit. Starte neu...");
+            bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
+            if (bmp280.begin(BMP280_ADDR_PRIMARY, &bmpWire) || bmp280.begin(BMP280_ADDR_SECONDARY, &bmpWire))
+            {
+                bmp280Ready = true;
+                out.println("[BMP280] Sensor gefunden.");
+            }
+            else
+            {
+                out.println("[BMP280] Sensor nicht gefunden (0x76/0x77 auf Pins 20/21). Verkabelung pruefen.");
+                return;
+            }
+        }
+        float bmpTemp = bmp280.readTemperature();
+        float bmpPress = bmp280.readPressure() / 100.0f;
+        float bmpAlt = bmp280.readAltitude(1013.25f);
+        if (isnan(bmpTemp))
+            bmpTemp = WX_PLACEHOLDER_VALUE;
+        if (isnan(bmpPress))
+            bmpPress = WX_PLACEHOLDER_VALUE;
+        if (isnan(bmpAlt))
+            bmpAlt = WX_PLACEHOLDER_VALUE;
+        out.print("[BMP280] Temperatur: ");
+        out.print(bmpTemp, 2);
+        out.println(" C");
+        out.print("[BMP280] Druck:      ");
+        out.print(bmpPress, 2);
+        out.println(" hPa");
+        out.print("[BMP280] Hoehe:      ");
+        out.print(bmpAlt, 1);
+        out.println(" m");
+#else
+        out.println("[BMP280] Bibliothek nicht vorhanden. Adafruit BMP280 installieren.");
+#endif
+        return;
+    }
+
     // Force-save settings to flash
     if (line == "/save")
     {
@@ -2554,6 +2734,8 @@ void setup()
     // BOOT button – configure early
     pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
 
+    Wire.begin(PIN_SDA, PIN_SCL);
+
     // OLED display init (before LoRa so errors can be shown on screen)
     VextON();
     delay(100);
@@ -2565,6 +2747,10 @@ void setup()
     display.display();
     displayActive = true;
     displayOnAt = millis();
+
+    // Weather sensors (DHT11 + BMP280)
+    initWeatherSensors();
+    updateWeatherReadings(true);
 
     // BLE setup (before LoRa so BLE works even if LoRa fails)
     char bleName[24];
@@ -2654,6 +2840,10 @@ void setup()
     out.println(nodeId, HEX);
     out.print("Weather-Mode: ");
     out.println(weatherModeEnabled ? "ON" : "OFF");
+    out.print("WX sensors: DHT11=");
+    out.print(dht22Ready ? "OK" : "ERR");
+    out.print(" BMP280=");
+    out.println(bmp280Ready ? "OK" : "ERR");
     out.println("Encryption: /mykey gen for eigenen Node-Key");
     out.print("BLE: ");
     out.print(bleName);
