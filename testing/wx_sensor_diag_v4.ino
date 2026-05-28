@@ -7,6 +7,10 @@ static const uint8_t PIN_BMP_SDA = 48;
 static const uint8_t PIN_BMP_SCL = 47;
 static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
+static const uint16_t DHT22_START_LOW_MS = 2;
+static const uint16_t DHT22_START_HIGH_US = 40;
+static const uint8_t BMP280_CONFIG_STANDBY_1000MS = 0xA0;
+static const uint8_t BMP280_CTRL_NORMAL_X1 = 0x27;
 
 static const uint32_t WX_READ_INTERVAL_MS = 2500;
 
@@ -138,8 +142,8 @@ static bool initBmp280()
         return false;
     }
 
-    if (!writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CONFIG, 0xA0) ||
-        !writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CTRL_MEAS, 0x27))
+    if (!writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CONFIG, BMP280_CONFIG_STANDBY_1000MS) ||
+        !writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CTRL_MEAS, BMP280_CTRL_NORMAL_X1))
     {
         bmpCal.valid = false;
         return false;
@@ -213,9 +217,9 @@ static bool readDht22Values(float &temperatureC, float &humidityPct)
 
     pinMode(PIN_DHT22, OUTPUT);
     digitalWrite(PIN_DHT22, LOW);
-    delay(2);
+    delay(DHT22_START_LOW_MS);
     digitalWrite(PIN_DHT22, HIGH);
-    delayMicroseconds(40);
+    delayMicroseconds(DHT22_START_HIGH_US);
     pinMode(PIN_DHT22, INPUT_PULLUP);
 
     if (pulseIn(PIN_DHT22, LOW, 120) == 0 || pulseIn(PIN_DHT22, HIGH, 120) == 0)
