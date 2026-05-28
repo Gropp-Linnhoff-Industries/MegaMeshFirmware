@@ -36,6 +36,8 @@
 #include <esp_sleep.h>      // ESP32 sleep modes
 #include <driver/rtc_io.h>  // GPIO wakeup for light sleep
 #include <Wire.h>           // I2C bus for display and BMP280
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
 #include "HT_SSD1306Wire.h" // OLED display library (Heltec)
 
 // for Arduino compiler
@@ -61,13 +63,6 @@ static const uint8_t PIN_BMP_SDA = 48;
 static const uint8_t PIN_BMP_SCL = 47;
 static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
-static const uint16_t DHT22_START_LOW_US = 2000;
-static const uint16_t DHT22_START_HIGH_US = 40;
-static const uint16_t DHT22_RESPONSE_TIMEOUT_US = 250;
-static const uint16_t DHT22_BIT_LOW_TIMEOUT_US = 250;
-static const uint16_t DHT22_BIT_HIGH_TIMEOUT_US = 300;
-static const uint8_t BMP280_CONFIG_STANDBY_1000MS = 0xA0;
-static const uint8_t BMP280_CTRL_NORMAL_X1 = 0x27;
 
 // Battery monitoring pins (Heltec V4)
 static const uint8_t PIN_VBAT_ADC = 1;
@@ -236,29 +231,12 @@ uint32_t lastWxReadAt = 0;
 static const uint32_t WX_READ_INTERVAL_MS = 2500;
 static const float WX_PLACEHOLDER_VALUE = -999.0f;
 
-struct Bmp280Calibration
-{
-    uint16_t digT1 = 0;
-    int16_t digT2 = 0;
-    int16_t digT3 = 0;
-    uint16_t digP1 = 0;
-    int16_t digP2 = 0;
-    int16_t digP3 = 0;
-    int16_t digP4 = 0;
-    int16_t digP5 = 0;
-    int16_t digP6 = 0;
-    int16_t digP7 = 0;
-    int16_t digP8 = 0;
-    int16_t digP9 = 0;
-    int32_t tFine = 0;
-    bool valid = false;
-};
-
-Bmp280Calibration bmp280Cal;
 uint8_t bmp280Address = 0;
 
 // Dedicated I2C bus for BMP280 on pins 48/47 (separate from OLED).
 TwoWire bmpWire(1);
+Adafruit_BMP280 bmp280Sensor;
+DHT dht22Sensor(PIN_DHT22, DHT22);
 
 // Bluetooth characteristic
 BLECharacteristic *pTxChar = nullptr;
@@ -900,61 +878,17 @@ void enterLightSleep()
     rtc_gpio_wakeup_disable(static_cast<gpio_num_t>(PIN_DIO1));
 }
 
-static bool readBytesFromWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t *buffer, size_t len)
-{
-    wireBus.beginTransmission(address);
-    wireBus.write(reg);
-    if (wireBus.endTransmission(false) != 0)
-    {
-        return false;
-    }
-
-    size_t received = wireBus.requestFrom(static_cast<int>(address), static_cast<int>(len));
-    if (received != len)
-    {
-        return false;
-    }
-
-    for (size_t i = 0; i < len; ++i)
-    {
-        buffer[i] = wireBus.read();
-    }
-    return true;
-}
-
-static bool writeByteToWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t value)
-{
-    wireBus.beginTransmission(address);
-    wireBus.write(reg);
-    wireBus.write(value);
-    return wireBus.endTransmission() == 0;
-}
-
 static bool initBmp280Sensor()
 {
-    static const uint8_t BMP280_REG_ID = 0xD0;
-    static const uint8_t BMP280_REG_CALIB = 0x88;
-    static const uint8_t BMP280_REG_CONFIG = 0xF5;
-    static const uint8_t BMP280_REG_CTRL_MEAS = 0xF4;
-    static const uint8_t BMP280_CHIP_ID = 0x58;
-
     const uint8_t addresses[] = {BMP280_ADDR_PRIMARY, BMP280_ADDR_SECONDARY};
-    uint8_t chipId = 0;
-
     bmp280Ready = false;
-    bmp280Cal.valid = false;
     bmp280Address = 0;
 
     bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
 
     for (uint8_t address : addresses)
     {
-        if (!readBytesFromWire(bmpWire, address, BMP280_REG_ID, &chipId, 1))
-        {
-            continue;
-        }
-
-        if (chipId == BMP280_CHIP_ID)
+        if (bmp280Sensor.begin(address, BMP280_CHIPID, &bmpWire))
         {
             bmp280Address = address;
             break;
@@ -966,37 +900,11 @@ static bool initBmp280Sensor()
         return false;
     }
 
-    uint8_t calib[24];
-    if (!readBytesFromWire(bmpWire, bmp280Address, BMP280_REG_CALIB, calib, sizeof(calib)))
-    {
-        return false;
-    }
-
-    bmp280Cal.digT1 = static_cast<uint16_t>(calib[1] << 8 | calib[0]);
-    bmp280Cal.digT2 = static_cast<int16_t>(calib[3] << 8 | calib[2]);
-    bmp280Cal.digT3 = static_cast<int16_t>(calib[5] << 8 | calib[4]);
-    bmp280Cal.digP1 = static_cast<uint16_t>(calib[7] << 8 | calib[6]);
-    bmp280Cal.digP2 = static_cast<int16_t>(calib[9] << 8 | calib[8]);
-    bmp280Cal.digP3 = static_cast<int16_t>(calib[11] << 8 | calib[10]);
-    bmp280Cal.digP4 = static_cast<int16_t>(calib[13] << 8 | calib[12]);
-    bmp280Cal.digP5 = static_cast<int16_t>(calib[15] << 8 | calib[14]);
-    bmp280Cal.digP6 = static_cast<int16_t>(calib[17] << 8 | calib[16]);
-    bmp280Cal.digP7 = static_cast<int16_t>(calib[19] << 8 | calib[18]);
-    bmp280Cal.digP8 = static_cast<int16_t>(calib[21] << 8 | calib[20]);
-    bmp280Cal.digP9 = static_cast<int16_t>(calib[23] << 8 | calib[22]);
-    bmp280Cal.valid = bmp280Cal.digT1 != 0 && bmp280Cal.digP1 != 0;
-
-    if (!bmp280Cal.valid)
-    {
-        return false;
-    }
-
-    if (!writeByteToWire(bmpWire, bmp280Address, BMP280_REG_CONFIG, BMP280_CONFIG_STANDBY_1000MS) ||
-        !writeByteToWire(bmpWire, bmp280Address, BMP280_REG_CTRL_MEAS, BMP280_CTRL_NORMAL_X1))
-    {
-        bmp280Cal.valid = false;
-        return false;
-    }
+    bmp280Sensor.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                             Adafruit_BMP280::SAMPLING_X1,
+                             Adafruit_BMP280::SAMPLING_X1,
+                             Adafruit_BMP280::FILTER_OFF,
+                             Adafruit_BMP280::STANDBY_MS_1000);
 
     bmp280Ready = true;
     return true;
@@ -1004,59 +912,20 @@ static bool initBmp280Sensor()
 
 static bool readBmp280Values(float &temperatureC, float &pressureHpa)
 {
-    static const uint8_t BMP280_REG_DATA = 0xF7;
-
-    if (!bmp280Ready || !bmp280Cal.valid || bmp280Address == 0)
+    if (!bmp280Ready)
     {
         return false;
     }
 
-    uint8_t data[6];
-    if (!readBytesFromWire(bmpWire, bmp280Address, BMP280_REG_DATA, data, sizeof(data)))
+    temperatureC = bmp280Sensor.readTemperature();
+    float pressurePa = bmp280Sensor.readPressure();
+    if (isnan(temperatureC) || isnan(pressurePa) || pressurePa <= 0.0f)
     {
         bmp280Ready = false;
-        bmp280Cal.valid = false;
         return false;
     }
 
-    int32_t rawPressure = (static_cast<int32_t>(data[0]) << 12) |
-                          (static_cast<int32_t>(data[1]) << 4) |
-                          (static_cast<int32_t>(data[2]) >> 4);
-    int32_t rawTemperature = (static_cast<int32_t>(data[3]) << 12) |
-                             (static_cast<int32_t>(data[4]) << 4) |
-                             (static_cast<int32_t>(data[5]) >> 4);
-
-    int32_t var1 = ((((rawTemperature >> 3) - (static_cast<int32_t>(bmp280Cal.digT1) << 1))) *
-                    static_cast<int32_t>(bmp280Cal.digT2)) >>
-                   11;
-    int32_t var2 = (((((rawTemperature >> 4) - static_cast<int32_t>(bmp280Cal.digT1)) *
-                      ((rawTemperature >> 4) - static_cast<int32_t>(bmp280Cal.digT1))) >>
-                     12) *
-                    static_cast<int32_t>(bmp280Cal.digT3)) >>
-                   14;
-    bmp280Cal.tFine = var1 + var2;
-    int32_t t = (bmp280Cal.tFine * 5 + 128) >> 8;
-    temperatureC = t / 100.0f;
-
-    int64_t pVar1 = static_cast<int64_t>(bmp280Cal.tFine) - 128000;
-    int64_t pVar2 = pVar1 * pVar1 * static_cast<int64_t>(bmp280Cal.digP6);
-    pVar2 += (pVar1 * static_cast<int64_t>(bmp280Cal.digP5)) << 17;
-    pVar2 += static_cast<int64_t>(bmp280Cal.digP4) << 35;
-    pVar1 = ((pVar1 * pVar1 * static_cast<int64_t>(bmp280Cal.digP3)) >> 8) +
-            ((pVar1 * static_cast<int64_t>(bmp280Cal.digP2)) << 12);
-    pVar1 = ((((static_cast<int64_t>(1) << 47) + pVar1)) * static_cast<int64_t>(bmp280Cal.digP1)) >> 33;
-
-    if (pVar1 == 0)
-    {
-        return false;
-    }
-
-    int64_t pressure = 1048576 - rawPressure;
-    pressure = (((pressure << 31) - pVar2) * 3125) / pVar1;
-    pVar1 = (static_cast<int64_t>(bmp280Cal.digP9) * (pressure >> 13) * (pressure >> 13)) >> 25;
-    pVar2 = (static_cast<int64_t>(bmp280Cal.digP8) * pressure) >> 19;
-    pressure = ((pressure + pVar1 + pVar2) >> 8) + (static_cast<int64_t>(bmp280Cal.digP7) << 4);
-    pressureHpa = (pressure / 256.0f) / 100.0f;
+    pressureHpa = pressurePa / 100.0f;
     return true;
 }
 
@@ -1071,66 +940,15 @@ static float pressureToAltitudeMeters(float pressureHpa, float seaLevelHpa = 101
 
 static bool readDht22Values(float &temperatureC, float &humidityPct)
 {
-    uint8_t data[5] = {0, 0, 0, 0, 0};
-
-    pinMode(PIN_DHT22, OUTPUT);
-    digitalWrite(PIN_DHT22, LOW);
-    delayMicroseconds(DHT22_START_LOW_US);
-    digitalWrite(PIN_DHT22, HIGH);
-    delayMicroseconds(DHT22_START_HIGH_US);
-    pinMode(PIN_DHT22, INPUT_PULLUP);
-
-    if (pulseIn(PIN_DHT22, LOW, DHT22_RESPONSE_TIMEOUT_US) == 0 ||
-        pulseIn(PIN_DHT22, HIGH, DHT22_RESPONSE_TIMEOUT_US) == 0)
-    {
-        return false;
-    }
-
-    for (uint8_t i = 0; i < 40; ++i)
-    {
-        if (pulseIn(PIN_DHT22, LOW, DHT22_BIT_LOW_TIMEOUT_US) == 0)
-        {
-            return false;
-        }
-
-        uint32_t highTime = pulseIn(PIN_DHT22, HIGH, DHT22_BIT_HIGH_TIMEOUT_US);
-        if (highTime == 0)
-        {
-            return false;
-        }
-
-        data[i / 8] <<= 1;
-        if (highTime > 40)
-        {
-            data[i / 8] |= 1;
-        }
-    }
-
-    uint16_t checksumSum = static_cast<uint16_t>(data[0]) + static_cast<uint16_t>(data[1]) +
-                           static_cast<uint16_t>(data[2]) + static_cast<uint16_t>(data[3]);
-    uint8_t checksum = static_cast<uint8_t>(checksumSum & 0xFF);
-    if (checksum != data[4])
-    {
-        return false;
-    }
-
-    uint16_t rawHumidity = static_cast<uint16_t>(data[0] << 8 | data[1]);
-    uint16_t rawTemp = static_cast<uint16_t>((data[2] & 0x7F) << 8 | data[3]);
-
-    humidityPct = rawHumidity * 0.1f;
-    temperatureC = rawTemp * 0.1f;
-    if (data[2] & 0x80)
-    {
-        temperatureC = -temperatureC;
-    }
-
-    return true;
+    temperatureC = dht22Sensor.readTemperature();
+    humidityPct = dht22Sensor.readHumidity();
+    return !isnan(temperatureC) && !isnan(humidityPct);
 }
 
 void initWeatherSensors()
 {
     dht22Ready = false;
-    pinMode(PIN_DHT22, INPUT_PULLUP);
+    dht22Sensor.begin();
 
     if (initBmp280Sensor())
     {
