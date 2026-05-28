@@ -1,24 +1,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-#if __has_include(<DHT.h>)
-#include <DHT.h>
-#define HAS_DHT22_LIB 1
-#else
-#define HAS_DHT22_LIB 0
-#endif
-
-#if __has_include(<Adafruit_BMP280.h>)
-#include <Adafruit_BMP280.h>
-#define HAS_BMP280_LIB 1
-#else
-#define HAS_BMP280_LIB 0
-#endif
-
 // Heltec LoRa 32 V4 sensor pins
 static const uint8_t PIN_DHT22 = 45;
-static const uint8_t PIN_BMP_SDA = 20;
-static const uint8_t PIN_BMP_SCL = 21;
+static const uint8_t PIN_BMP_SDA = 48;
+static const uint8_t PIN_BMP_SCL = 47;
 static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
 
@@ -35,44 +21,256 @@ bool autoRead = true;
 
 TwoWire bmpWire(1);
 
-#if HAS_DHT22_LIB
-DHT dht(PIN_DHT22, DHT11);
-#endif
+struct Bmp280Calibration
+{
+    uint16_t digT1 = 0;
+    int16_t digT2 = 0;
+    int16_t digT3 = 0;
+    uint16_t digP1 = 0;
+    int16_t digP2 = 0;
+    int16_t digP3 = 0;
+    int16_t digP4 = 0;
+    int16_t digP5 = 0;
+    int16_t digP6 = 0;
+    int16_t digP7 = 0;
+    int16_t digP8 = 0;
+    int16_t digP9 = 0;
+    int32_t tFine = 0;
+    bool valid = false;
+};
 
-#if HAS_BMP280_LIB
-Adafruit_BMP280 bmp;
-#endif
+Bmp280Calibration bmpCal;
+uint8_t bmpAddress = 0;
 
 void printLibStatus()
 {
-    Serial.print("DHT lib: ");
-    Serial.println(HAS_DHT22_LIB ? "OK" : "MISSING");
-    Serial.print("BMP280 lib: ");
-    Serial.println(HAS_BMP280_LIB ? "OK" : "MISSING");
+    Serial.println("DHT lib: INTERNAL");
+    Serial.println("BMP280 lib: INTERNAL");
+}
+
+static bool readBytesFromWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t *buffer, size_t len)
+{
+    wireBus.beginTransmission(address);
+    wireBus.write(reg);
+    if (wireBus.endTransmission(false) != 0)
+    {
+        return false;
+    }
+
+    size_t received = wireBus.requestFrom(static_cast<int>(address), static_cast<int>(len));
+    if (received != len)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; ++i)
+    {
+        buffer[i] = wireBus.read();
+    }
+    return true;
+}
+
+static bool writeByteToWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t value)
+{
+    wireBus.beginTransmission(address);
+    wireBus.write(reg);
+    wireBus.write(value);
+    return wireBus.endTransmission() == 0;
+}
+
+static bool initBmp280()
+{
+    static const uint8_t BMP280_REG_ID = 0xD0;
+    static const uint8_t BMP280_REG_CALIB = 0x88;
+    static const uint8_t BMP280_REG_CONFIG = 0xF5;
+    static const uint8_t BMP280_REG_CTRL_MEAS = 0xF4;
+    static const uint8_t BMP280_CHIP_ID = 0x58;
+
+    const uint8_t addresses[] = {BMP280_ADDR_PRIMARY, BMP280_ADDR_SECONDARY};
+    uint8_t chipId = 0;
+
+    bmpReady = false;
+    bmpCal.valid = false;
+    bmpAddress = 0;
+    bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
+
+    for (uint8_t address : addresses)
+    {
+        if (!readBytesFromWire(bmpWire, address, BMP280_REG_ID, &chipId, 1))
+        {
+            continue;
+        }
+
+        if (chipId == BMP280_CHIP_ID)
+        {
+            bmpAddress = address;
+            break;
+        }
+    }
+
+    if (bmpAddress == 0)
+    {
+        return false;
+    }
+
+    uint8_t calib[24];
+    if (!readBytesFromWire(bmpWire, bmpAddress, BMP280_REG_CALIB, calib, sizeof(calib)))
+    {
+        return false;
+    }
+
+    bmpCal.digT1 = static_cast<uint16_t>(calib[1] << 8 | calib[0]);
+    bmpCal.digT2 = static_cast<int16_t>(calib[3] << 8 | calib[2]);
+    bmpCal.digT3 = static_cast<int16_t>(calib[5] << 8 | calib[4]);
+    bmpCal.digP1 = static_cast<uint16_t>(calib[7] << 8 | calib[6]);
+    bmpCal.digP2 = static_cast<int16_t>(calib[9] << 8 | calib[8]);
+    bmpCal.digP3 = static_cast<int16_t>(calib[11] << 8 | calib[10]);
+    bmpCal.digP4 = static_cast<int16_t>(calib[13] << 8 | calib[12]);
+    bmpCal.digP5 = static_cast<int16_t>(calib[15] << 8 | calib[14]);
+    bmpCal.digP6 = static_cast<int16_t>(calib[17] << 8 | calib[16]);
+    bmpCal.digP7 = static_cast<int16_t>(calib[19] << 8 | calib[18]);
+    bmpCal.digP8 = static_cast<int16_t>(calib[21] << 8 | calib[20]);
+    bmpCal.digP9 = static_cast<int16_t>(calib[23] << 8 | calib[22]);
+    bmpCal.valid = bmpCal.digP1 != 0;
+
+    if (!bmpCal.valid)
+    {
+        return false;
+    }
+
+    if (!writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CONFIG, 0xA0) ||
+        !writeByteToWire(bmpWire, bmpAddress, BMP280_REG_CTRL_MEAS, 0x27))
+    {
+        bmpCal.valid = false;
+        return false;
+    }
+
+    bmpReady = true;
+    return true;
+}
+
+static bool readBmp280Values(float &temperatureC, float &pressureHpa)
+{
+    static const uint8_t BMP280_REG_DATA = 0xF7;
+
+    if (!bmpReady || !bmpCal.valid || bmpAddress == 0)
+    {
+        return false;
+    }
+
+    uint8_t data[6];
+    if (!readBytesFromWire(bmpWire, bmpAddress, BMP280_REG_DATA, data, sizeof(data)))
+    {
+        bmpReady = false;
+        bmpCal.valid = false;
+        return false;
+    }
+
+    int32_t rawPressure = (static_cast<int32_t>(data[0]) << 12) |
+                          (static_cast<int32_t>(data[1]) << 4) |
+                          (static_cast<int32_t>(data[2]) >> 4);
+    int32_t rawTemperature = (static_cast<int32_t>(data[3]) << 12) |
+                             (static_cast<int32_t>(data[4]) << 4) |
+                             (static_cast<int32_t>(data[5]) >> 4);
+
+    int32_t var1 = ((((rawTemperature >> 3) - (static_cast<int32_t>(bmpCal.digT1) << 1))) *
+                    static_cast<int32_t>(bmpCal.digT2)) >>
+                   11;
+    int32_t var2 = (((((rawTemperature >> 4) - static_cast<int32_t>(bmpCal.digT1)) *
+                      ((rawTemperature >> 4) - static_cast<int32_t>(bmpCal.digT1))) >>
+                     12) *
+                    static_cast<int32_t>(bmpCal.digT3)) >>
+                   14;
+    bmpCal.tFine = var1 + var2;
+    int32_t t = (bmpCal.tFine * 5 + 128) >> 8;
+    temperatureC = t / 100.0f;
+
+    int64_t pVar1 = static_cast<int64_t>(bmpCal.tFine) - 128000;
+    int64_t pVar2 = pVar1 * pVar1 * static_cast<int64_t>(bmpCal.digP6);
+    pVar2 += (pVar1 * static_cast<int64_t>(bmpCal.digP5)) << 17;
+    pVar2 += static_cast<int64_t>(bmpCal.digP4) << 35;
+    pVar1 = ((pVar1 * pVar1 * static_cast<int64_t>(bmpCal.digP3)) >> 8) +
+            ((pVar1 * static_cast<int64_t>(bmpCal.digP2)) << 12);
+    pVar1 = ((((static_cast<int64_t>(1) << 47) + pVar1)) * static_cast<int64_t>(bmpCal.digP1)) >> 33;
+
+    if (pVar1 == 0)
+    {
+        return false;
+    }
+
+    int64_t pressure = 1048576 - rawPressure;
+    pressure = (((pressure << 31) - pVar2) * 3125) / pVar1;
+    pVar1 = (static_cast<int64_t>(bmpCal.digP9) * (pressure >> 13) * (pressure >> 13)) >> 25;
+    pVar2 = (static_cast<int64_t>(bmpCal.digP8) * pressure) >> 19;
+    pressure = ((pressure + pVar1 + pVar2) >> 8) + (static_cast<int64_t>(bmpCal.digP7) << 4);
+    pressureHpa = (pressure / 256.0f) / 100.0f;
+    return true;
+}
+
+static bool readDht22Values(float &temperatureC, float &humidityPct)
+{
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+
+    pinMode(PIN_DHT22, OUTPUT);
+    digitalWrite(PIN_DHT22, LOW);
+    delay(2);
+    digitalWrite(PIN_DHT22, HIGH);
+    delayMicroseconds(40);
+    pinMode(PIN_DHT22, INPUT_PULLUP);
+
+    if (pulseIn(PIN_DHT22, LOW, 120) == 0 || pulseIn(PIN_DHT22, HIGH, 120) == 0)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < 40; ++i)
+    {
+        if (pulseIn(PIN_DHT22, LOW, 100) == 0)
+        {
+            return false;
+        }
+
+        uint32_t highTime = pulseIn(PIN_DHT22, HIGH, 150);
+        if (highTime == 0)
+        {
+            return false;
+        }
+
+        data[i / 8] <<= 1;
+        if (highTime > 40)
+        {
+            data[i / 8] |= 1;
+        }
+    }
+
+    uint8_t checksum = static_cast<uint8_t>(data[0] + data[1] + data[2] + data[3]);
+    if (checksum != data[4])
+    {
+        return false;
+    }
+
+    uint16_t rawHumidity = static_cast<uint16_t>(data[0] << 8 | data[1]);
+    uint16_t rawTemp = static_cast<uint16_t>((data[2] & 0x7F) << 8 | data[3]);
+
+    humidityPct = rawHumidity * 0.1f;
+    temperatureC = rawTemp * 0.1f;
+    if (data[2] & 0x80)
+    {
+        temperatureC = -temperatureC;
+    }
+
+    return true;
 }
 
 void initSensors()
 {
-#if HAS_DHT22_LIB
-    dht.begin();
-    dhtReady = true;
-#else
     dhtReady = false;
-#endif
+    pinMode(PIN_DHT22, INPUT_PULLUP);
 
-#if HAS_BMP280_LIB
-    if (bmp.begin(BMP280_ADDR_PRIMARY, &bmpWire) || bmp.begin(BMP280_ADDR_SECONDARY, &bmpWire))
+    if (!initBmp280())
     {
-        bmpReady = true;
+        Serial.println("[WX] BMP280 nicht gefunden (0x76/0x77 auf Pins 48/47)");
     }
-    else
-    {
-        bmpReady = false;
-        Serial.println("[WX] BMP280 nicht gefunden (0x76/0x77)");
-    }
-#else
-    bmpReady = false;
-#endif
 }
 
 void updateWeatherReadings(bool force)
@@ -84,27 +282,29 @@ void updateWeatherReadings(bool force)
     }
     lastWxReadAt = nowMs;
 
-#if HAS_DHT22_LIB
-    if (dhtReady)
+    float dhtTemp = NAN;
+    float dhtHum = NAN;
+    if (readDht22Values(dhtTemp, dhtHum))
     {
-        float t = dht.readTemperature();
-        float h = dht.readHumidity();
-        if (!isnan(t))
-        {
-            lastTempC = t;
-        }
-        if (!isnan(h))
-        {
-            lastHumidity = h;
-        }
+        dhtReady = true;
+        lastTempC = dhtTemp;
+        lastHumidity = dhtHum;
     }
-#endif
-
-#if HAS_BMP280_LIB
-    if (bmpReady)
+    else
     {
-        float bt = bmp.readTemperature();
-        float bp = bmp.readPressure() / 100.0f;
+        dhtReady = false;
+    }
+
+    if (!bmpReady)
+    {
+        initBmp280();
+    }
+
+    float bt = NAN;
+    float bp = NAN;
+    if (readBmp280Values(bt, bp))
+    {
+        bmpReady = true;
         if (isnan(lastTempC) && !isnan(bt))
         {
             lastTempC = bt;
@@ -114,7 +314,10 @@ void updateWeatherReadings(bool force)
             lastPressureHpa = bp;
         }
     }
-#endif
+    else
+    {
+        bmpReady = false;
+    }
 }
 
 String buildWeatherPayload()
@@ -176,7 +379,7 @@ void printHelp()
     Serial.println("  packet        -> print payload as firmware would send");
     Serial.println("  req           -> simulate incoming #MESH_WX_REQ and print outgoing payload");
     Serial.println("  auto on|off   -> periodic reads every 2.5s");
-    Serial.println("  status        -> print sensor and lib status");
+    Serial.println("  status        -> print sensor status");
     Serial.println("  help          -> show commands");
 }
 
@@ -197,9 +400,9 @@ void handleCommand(String line)
     if (line == "status")
     {
         printLibStatus();
-        Serial.print("DHT sensor: ");
+        Serial.print("DHT22 sensor: ");
         Serial.println(dhtReady ? "READY" : "NOT READY");
-        Serial.print("BMP sensor: ");
+        Serial.print("BMP280 sensor: ");
         Serial.println(bmpReady ? "READY" : "NOT READY");
         return;
     }
@@ -250,10 +453,9 @@ void setup()
     Serial.begin(115200);
     delay(300);
 
-    bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
-
     printLibStatus();
     initSensors();
+    updateWeatherReadings(true);
     printHelp();
 }
 

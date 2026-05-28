@@ -38,20 +38,6 @@
 #include <Wire.h>           // I2C bus for display and BMP280
 #include "HT_SSD1306Wire.h" // OLED display library (Heltec)
 
-#if __has_include(<DHT.h>)
-#include <DHT.h>
-#define HAS_DHT22_LIB 1
-#else
-#define HAS_DHT22_LIB 0
-#endif
-
-#if __has_include(<Adafruit_BMP280.h>)
-#include <Adafruit_BMP280.h>
-#define HAS_BMP280_LIB 1
-#else
-#define HAS_BMP280_LIB 0
-#endif
-
 // for Arduino compiler
 struct MeshHeader;
 struct PersistentSettings;
@@ -69,10 +55,10 @@ static const uint8_t PIN_DIO1 = 14;
 static const uint8_t PIN_SDA = 17;
 static const uint8_t PIN_SCL = 18;
 
-// Weather sensor pins (adjust DHT11 pin to your wiring)
+// Weather sensor pins
 static const uint8_t PIN_DHT22 = 45;
-static const uint8_t PIN_BMP_SDA = 20;
-static const uint8_t PIN_BMP_SCL = 21;
+static const uint8_t PIN_BMP_SDA = 48;
+static const uint8_t PIN_BMP_SCL = 47;
 static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
 
@@ -243,15 +229,28 @@ uint32_t lastWxReadAt = 0;
 static const uint32_t WX_READ_INTERVAL_MS = 2500;
 static const float WX_PLACEHOLDER_VALUE = -999.0f;
 
-#if HAS_DHT22_LIB
-DHT dht22(PIN_DHT22, DHT11);
-#endif
+struct Bmp280Calibration
+{
+    uint16_t digT1 = 0;
+    int16_t digT2 = 0;
+    int16_t digT3 = 0;
+    uint16_t digP1 = 0;
+    int16_t digP2 = 0;
+    int16_t digP3 = 0;
+    int16_t digP4 = 0;
+    int16_t digP5 = 0;
+    int16_t digP6 = 0;
+    int16_t digP7 = 0;
+    int16_t digP8 = 0;
+    int16_t digP9 = 0;
+    int32_t tFine = 0;
+    bool valid = false;
+};
 
-#if HAS_BMP280_LIB
-Adafruit_BMP280 bmp280;
-#endif
+Bmp280Calibration bmp280Cal;
+uint8_t bmp280Address = 0;
 
-// Dedicated I2C bus for BMP280 on pins 20/21 (separate from OLED).
+// Dedicated I2C bus for BMP280 on pins 48/47 (separate from OLED).
 TwoWire bmpWire(1);
 
 // Bluetooth characteristic
@@ -894,31 +893,253 @@ void enterLightSleep()
     rtc_gpio_wakeup_disable(static_cast<gpio_num_t>(PIN_DIO1));
 }
 
+static bool readBytesFromWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t *buffer, size_t len)
+{
+    wireBus.beginTransmission(address);
+    wireBus.write(reg);
+    if (wireBus.endTransmission(false) != 0)
+    {
+        return false;
+    }
+
+    size_t received = wireBus.requestFrom(static_cast<int>(address), static_cast<int>(len));
+    if (received != len)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; ++i)
+    {
+        buffer[i] = wireBus.read();
+    }
+    return true;
+}
+
+static bool writeByteToWire(TwoWire &wireBus, uint8_t address, uint8_t reg, uint8_t value)
+{
+    wireBus.beginTransmission(address);
+    wireBus.write(reg);
+    wireBus.write(value);
+    return wireBus.endTransmission() == 0;
+}
+
+static bool initBmp280Sensor()
+{
+    static const uint8_t BMP280_REG_ID = 0xD0;
+    static const uint8_t BMP280_REG_CALIB = 0x88;
+    static const uint8_t BMP280_REG_CONFIG = 0xF5;
+    static const uint8_t BMP280_REG_CTRL_MEAS = 0xF4;
+    static const uint8_t BMP280_CHIP_ID = 0x58;
+
+    const uint8_t addresses[] = {BMP280_ADDR_PRIMARY, BMP280_ADDR_SECONDARY};
+    uint8_t chipId = 0;
+
+    bmp280Ready = false;
+    bmp280Cal.valid = false;
+    bmp280Address = 0;
+
+    bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
+
+    for (uint8_t address : addresses)
+    {
+        if (!readBytesFromWire(bmpWire, address, BMP280_REG_ID, &chipId, 1))
+        {
+            continue;
+        }
+
+        if (chipId == BMP280_CHIP_ID)
+        {
+            bmp280Address = address;
+            break;
+        }
+    }
+
+    if (bmp280Address == 0)
+    {
+        return false;
+    }
+
+    uint8_t calib[24];
+    if (!readBytesFromWire(bmpWire, bmp280Address, BMP280_REG_CALIB, calib, sizeof(calib)))
+    {
+        return false;
+    }
+
+    bmp280Cal.digT1 = static_cast<uint16_t>(calib[1] << 8 | calib[0]);
+    bmp280Cal.digT2 = static_cast<int16_t>(calib[3] << 8 | calib[2]);
+    bmp280Cal.digT3 = static_cast<int16_t>(calib[5] << 8 | calib[4]);
+    bmp280Cal.digP1 = static_cast<uint16_t>(calib[7] << 8 | calib[6]);
+    bmp280Cal.digP2 = static_cast<int16_t>(calib[9] << 8 | calib[8]);
+    bmp280Cal.digP3 = static_cast<int16_t>(calib[11] << 8 | calib[10]);
+    bmp280Cal.digP4 = static_cast<int16_t>(calib[13] << 8 | calib[12]);
+    bmp280Cal.digP5 = static_cast<int16_t>(calib[15] << 8 | calib[14]);
+    bmp280Cal.digP6 = static_cast<int16_t>(calib[17] << 8 | calib[16]);
+    bmp280Cal.digP7 = static_cast<int16_t>(calib[19] << 8 | calib[18]);
+    bmp280Cal.digP8 = static_cast<int16_t>(calib[21] << 8 | calib[20]);
+    bmp280Cal.digP9 = static_cast<int16_t>(calib[23] << 8 | calib[22]);
+    bmp280Cal.valid = bmp280Cal.digP1 != 0;
+
+    if (!bmp280Cal.valid)
+    {
+        return false;
+    }
+
+    if (!writeByteToWire(bmpWire, bmp280Address, BMP280_REG_CONFIG, 0xA0) ||
+        !writeByteToWire(bmpWire, bmp280Address, BMP280_REG_CTRL_MEAS, 0x27))
+    {
+        bmp280Cal.valid = false;
+        return false;
+    }
+
+    bmp280Ready = true;
+    return true;
+}
+
+static bool readBmp280Values(float &temperatureC, float &pressureHpa)
+{
+    static const uint8_t BMP280_REG_DATA = 0xF7;
+
+    if (!bmp280Ready || !bmp280Cal.valid || bmp280Address == 0)
+    {
+        return false;
+    }
+
+    uint8_t data[6];
+    if (!readBytesFromWire(bmpWire, bmp280Address, BMP280_REG_DATA, data, sizeof(data)))
+    {
+        bmp280Ready = false;
+        bmp280Cal.valid = false;
+        return false;
+    }
+
+    int32_t rawPressure = (static_cast<int32_t>(data[0]) << 12) |
+                          (static_cast<int32_t>(data[1]) << 4) |
+                          (static_cast<int32_t>(data[2]) >> 4);
+    int32_t rawTemperature = (static_cast<int32_t>(data[3]) << 12) |
+                             (static_cast<int32_t>(data[4]) << 4) |
+                             (static_cast<int32_t>(data[5]) >> 4);
+
+    int32_t var1 = ((((rawTemperature >> 3) - (static_cast<int32_t>(bmp280Cal.digT1) << 1))) *
+                    static_cast<int32_t>(bmp280Cal.digT2)) >>
+                   11;
+    int32_t var2 = (((((rawTemperature >> 4) - static_cast<int32_t>(bmp280Cal.digT1)) *
+                      ((rawTemperature >> 4) - static_cast<int32_t>(bmp280Cal.digT1))) >>
+                     12) *
+                    static_cast<int32_t>(bmp280Cal.digT3)) >>
+                   14;
+    bmp280Cal.tFine = var1 + var2;
+    int32_t t = (bmp280Cal.tFine * 5 + 128) >> 8;
+    temperatureC = t / 100.0f;
+
+    int64_t pVar1 = static_cast<int64_t>(bmp280Cal.tFine) - 128000;
+    int64_t pVar2 = pVar1 * pVar1 * static_cast<int64_t>(bmp280Cal.digP6);
+    pVar2 += (pVar1 * static_cast<int64_t>(bmp280Cal.digP5)) << 17;
+    pVar2 += static_cast<int64_t>(bmp280Cal.digP4) << 35;
+    pVar1 = ((pVar1 * pVar1 * static_cast<int64_t>(bmp280Cal.digP3)) >> 8) +
+            ((pVar1 * static_cast<int64_t>(bmp280Cal.digP2)) << 12);
+    pVar1 = ((((static_cast<int64_t>(1) << 47) + pVar1)) * static_cast<int64_t>(bmp280Cal.digP1)) >> 33;
+
+    if (pVar1 == 0)
+    {
+        return false;
+    }
+
+    int64_t pressure = 1048576 - rawPressure;
+    pressure = (((pressure << 31) - pVar2) * 3125) / pVar1;
+    pVar1 = (static_cast<int64_t>(bmp280Cal.digP9) * (pressure >> 13) * (pressure >> 13)) >> 25;
+    pVar2 = (static_cast<int64_t>(bmp280Cal.digP8) * pressure) >> 19;
+    pressure = ((pressure + pVar1 + pVar2) >> 8) + (static_cast<int64_t>(bmp280Cal.digP7) << 4);
+    pressureHpa = (pressure / 256.0f) / 100.0f;
+    return true;
+}
+
+static float pressureToAltitudeMeters(float pressureHpa, float seaLevelHpa = 1013.25f)
+{
+    if (pressureHpa <= 0.0f)
+    {
+        return NAN;
+    }
+    return 44330.0f * (1.0f - powf(pressureHpa / seaLevelHpa, 0.1903f));
+}
+
+static bool readDht22Values(float &temperatureC, float &humidityPct)
+{
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+
+    pinMode(PIN_DHT22, OUTPUT);
+    digitalWrite(PIN_DHT22, LOW);
+    delay(2);
+    digitalWrite(PIN_DHT22, HIGH);
+    delayMicroseconds(40);
+    pinMode(PIN_DHT22, INPUT_PULLUP);
+
+    if (pulseIn(PIN_DHT22, LOW, 120) == 0 || pulseIn(PIN_DHT22, HIGH, 120) == 0)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < 40; ++i)
+    {
+        if (pulseIn(PIN_DHT22, LOW, 100) == 0)
+        {
+            return false;
+        }
+
+        uint32_t highTime = pulseIn(PIN_DHT22, HIGH, 150);
+        if (highTime == 0)
+        {
+            return false;
+        }
+
+        data[i / 8] <<= 1;
+        if (highTime > 40)
+        {
+            data[i / 8] |= 1;
+        }
+    }
+
+    uint8_t checksum = static_cast<uint8_t>(data[0] + data[1] + data[2] + data[3]);
+    if (checksum != data[4])
+    {
+        return false;
+    }
+
+    uint16_t rawHumidity = static_cast<uint16_t>(data[0] << 8 | data[1]);
+    uint16_t rawTemp = static_cast<uint16_t>((data[2] & 0x7F) << 8 | data[3]);
+
+    humidityPct = rawHumidity * 0.1f;
+    temperatureC = rawTemp * 0.1f;
+    if (data[2] & 0x80)
+    {
+        temperatureC = -temperatureC;
+    }
+
+    return true;
+}
+
 void initWeatherSensors()
 {
-#if HAS_DHT22_LIB
-    dht22.begin();
-    dht22Ready = true;
-#else
     dht22Ready = false;
-    out.println("[WX] DHT library missing. Install DHT sensor library.");
-#endif
+    pinMode(PIN_DHT22, INPUT_PULLUP);
 
-#if HAS_BMP280_LIB
-    bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
-    if (bmp280.begin(BMP280_ADDR_PRIMARY, &bmpWire) || bmp280.begin(BMP280_ADDR_SECONDARY, &bmpWire))
+    if (initBmp280Sensor())
     {
-        bmp280Ready = true;
+        out.print("[WX] BMP280 bereit an 0x");
+        out.print(bmp280Address, HEX);
+        out.print(" auf Pins ");
+        out.print(PIN_BMP_SDA);
+        out.print("/");
+        out.println(PIN_BMP_SCL);
     }
     else
     {
         bmp280Ready = false;
-        out.println("[WX] BMP280 not found at 0x76/0x77 on pins 20/21.");
+        out.print("[WX] BMP280 nicht gefunden (0x76/0x77 auf Pins ");
+        out.print(PIN_BMP_SDA);
+        out.print("/");
+        out.print(PIN_BMP_SCL);
+        out.println(").");
     }
-#else
-    bmp280Ready = false;
-    out.println("[WX] BMP280 library missing. Install Adafruit BMP280 library.");
-#endif
 }
 
 void updateWeatherReadings(bool force = false)
@@ -930,30 +1151,31 @@ void updateWeatherReadings(bool force = false)
     }
     lastWxReadAt = nowMs;
 
-#if HAS_DHT22_LIB
-    if (dht22Ready)
+    float dhtTemp = NAN;
+    float dhtHum = NAN;
+    if (readDht22Values(dhtTemp, dhtHum))
     {
-        float dhtTemp = dht22.readTemperature();
-        float dhtHum = dht22.readHumidity();
-        if (!isnan(dhtTemp))
-        {
-            lastTempC = dhtTemp;
-        }
-        if (!isnan(dhtHum))
-        {
-            lastHumidity = dhtHum;
-        }
+        dht22Ready = true;
+        lastTempC = dhtTemp;
+        lastHumidity = dhtHum;
     }
-#endif
-
-#if HAS_BMP280_LIB
-    if (bmp280Ready)
+    else
     {
-        float bmpTemp = bmp280.readTemperature();
-        float bmpPress = bmp280.readPressure() / 100.0f;
+        dht22Ready = false;
+    }
+
+    if (!bmp280Ready)
+    {
+        initBmp280Sensor();
+    }
+
+    float bmpTemp = NAN;
+    float bmpPress = NAN;
+    if (readBmp280Values(bmpTemp, bmpPress))
+    {
+        bmp280Ready = true;
         if (isnan(lastTempC) && !isnan(bmpTemp))
         {
-            // If DHT temperature is not available, use BMP280 as fallback.
             lastTempC = bmpTemp;
         }
         if (!isnan(bmpPress))
@@ -961,7 +1183,10 @@ void updateWeatherReadings(bool force = false)
             lastPressureHpa = bmpPress;
         }
     }
-#endif
+    else
+    {
+        bmp280Ready = false;
+    }
 }
 
 void cryptPayload(uint8_t *buffer, size_t len, const uint8_t *key, const MeshHeader &header)
@@ -1438,9 +1663,9 @@ void sendDiscoveryResponse(uint16_t requester)
     sendTextTo(MESH_BROADCAST, payload);
 }
 
-String weatherInfo()
+String weatherInfo(bool forceRead = false)
 {
-    updateWeatherReadings();
+    updateWeatherReadings(forceRead);
 
     const bool tempValid = !isnan(lastTempC);
     const bool humValid = !isnan(lastHumidity);
@@ -1494,7 +1719,7 @@ void sendWeatherRequest(uint16_t destination)
 
 void sendWeatherResponse(uint16_t destination)
 {
-    String payload = weatherInfo();
+    String payload = weatherInfo(true);
     if (sendTextTo(destination, payload))
     {
         out.print("WX response gesendet an 0x");
@@ -2002,6 +2227,7 @@ void printHelp()
     out.println(F("/battery           -> Batteriespannung anzeigen"));
     out.println(F("/txpower <2..22>   -> SX1262 Chip-Power (GC1109 PA verstaerkt non-linear)"));
     out.println(F("/sleep on|off|status -> Schlafmodus (DIO1 wakeup)"));
+    out.println(F("/wxtest            -> DHT22/BMP280 lokal ueber Serial auslesen"));
     out.println(F("/bmptest           -> BMP280 Sensor testen (Temp/Druck/Hoehe)"));
     out.println(F("/save              -> Einstellungen sofort auf Flash speichern"));
     out.println(F("/settings          -> alle Einstellungen anzeigen (JSON)"));
@@ -2193,8 +2419,13 @@ void handleSerialLine(String line)
 
     if (line == "/wx status")
     {
+        updateWeatherReadings(true);
         out.print("Weather-Mode: ");
         out.println(weatherModeEnabled ? "ON" : "OFF");
+        out.print("DHT22: ");
+        out.println(dht22Ready ? "OK" : "ERR");
+        out.print("BMP280: ");
+        out.println(bmp280Ready ? "OK" : "ERR");
         return;
     }
 
@@ -2537,28 +2768,59 @@ void handleSerialLine(String line)
         return;
     }
 
+    if (line == "/wxtest")
+    {
+        updateWeatherReadings(true);
+        out.print("[WX] tempC=");
+        if (isnan(lastTempC))
+            out.print("nan");
+        else
+            out.print(lastTempC, 1);
+        out.print(" hum=");
+        if (isnan(lastHumidity))
+            out.print("nan");
+        else
+            out.print(lastHumidity, 1);
+        out.print(" hPa=");
+        if (isnan(lastPressureHpa))
+            out.print("nan");
+        else
+            out.print(lastPressureHpa, 1);
+        out.print(" | DHT22=");
+        out.print(dht22Ready ? "OK" : "ERR");
+        out.print(" BMP280=");
+        out.println(bmp280Ready ? "OK" : "ERR");
+        out.print("[WX] payload=");
+        out.println(weatherInfo(false));
+        return;
+    }
+
     // BMP280 sensor test
     if (line == "/bmptest")
     {
-#if HAS_BMP280_LIB
         if (!bmp280Ready)
         {
             out.println("[BMP280] Sensor nicht bereit. Starte neu...");
-            bmpWire.begin(PIN_BMP_SDA, PIN_BMP_SCL);
-            if (bmp280.begin(BMP280_ADDR_PRIMARY, &bmpWire) || bmp280.begin(BMP280_ADDR_SECONDARY, &bmpWire))
+            if (initBmp280Sensor())
             {
                 bmp280Ready = true;
                 out.println("[BMP280] Sensor gefunden.");
             }
             else
             {
-                out.println("[BMP280] Sensor nicht gefunden (0x76/0x77 auf Pins 20/21). Verkabelung pruefen.");
+                out.println("[BMP280] Sensor nicht gefunden (0x76/0x77 auf Pins 48/47). Verkabelung pruefen.");
                 return;
             }
         }
-        float bmpTemp = bmp280.readTemperature();
-        float bmpPress = bmp280.readPressure() / 100.0f;
-        float bmpAlt = bmp280.readAltitude(1013.25f);
+        float bmpTemp = NAN;
+        float bmpPress = NAN;
+        if (!readBmp280Values(bmpTemp, bmpPress))
+        {
+            bmp280Ready = false;
+            out.println("[BMP280] Lesen fehlgeschlagen.");
+            return;
+        }
+        float bmpAlt = pressureToAltitudeMeters(bmpPress);
         if (isnan(bmpTemp))
             bmpTemp = WX_PLACEHOLDER_VALUE;
         if (isnan(bmpPress))
@@ -2574,9 +2836,6 @@ void handleSerialLine(String line)
         out.print("[BMP280] Hoehe:      ");
         out.print(bmpAlt, 1);
         out.println(" m");
-#else
-        out.println("[BMP280] Bibliothek nicht vorhanden. Adafruit BMP280 installieren.");
-#endif
         return;
     }
 
@@ -2748,7 +3007,7 @@ void setup()
     displayActive = true;
     displayOnAt = millis();
 
-    // Weather sensors (DHT11 + BMP280)
+    // Weather sensors (DHT22 + BMP280)
     initWeatherSensors();
     updateWeatherReadings(true);
 
@@ -2840,7 +3099,7 @@ void setup()
     out.println(nodeId, HEX);
     out.print("Weather-Mode: ");
     out.println(weatherModeEnabled ? "ON" : "OFF");
-    out.print("WX sensors: DHT11=");
+    out.print("WX sensors: DHT22=");
     out.print(dht22Ready ? "OK" : "ERR");
     out.print(" BMP280=");
     out.println(bmp280Ready ? "OK" : "ERR");
