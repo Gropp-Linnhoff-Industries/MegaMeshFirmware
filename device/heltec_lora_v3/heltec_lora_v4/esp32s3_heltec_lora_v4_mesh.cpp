@@ -63,6 +63,9 @@ static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
 static const uint16_t DHT22_START_LOW_US = 2000;
 static const uint16_t DHT22_START_HIGH_US = 40;
+static const uint16_t DHT22_RESPONSE_TIMEOUT_US = 250;
+static const uint16_t DHT22_BIT_LOW_TIMEOUT_US = 250;
+static const uint16_t DHT22_BIT_HIGH_TIMEOUT_US = 300;
 static const uint8_t BMP280_CONFIG_STANDBY_1000MS = 0xA0;
 static const uint8_t BMP280_CTRL_NORMAL_X1 = 0x27;
 
@@ -981,7 +984,7 @@ static bool initBmp280Sensor()
     bmp280Cal.digP7 = static_cast<int16_t>(calib[19] << 8 | calib[18]);
     bmp280Cal.digP8 = static_cast<int16_t>(calib[21] << 8 | calib[20]);
     bmp280Cal.digP9 = static_cast<int16_t>(calib[23] << 8 | calib[22]);
-    bmp280Cal.valid = bmp280Cal.digP1 != 0;
+    bmp280Cal.valid = bmp280Cal.digT1 != 0 && bmp280Cal.digP1 != 0;
 
     if (!bmp280Cal.valid)
     {
@@ -1077,19 +1080,20 @@ static bool readDht22Values(float &temperatureC, float &humidityPct)
     delayMicroseconds(DHT22_START_HIGH_US);
     pinMode(PIN_DHT22, INPUT_PULLUP);
 
-    if (pulseIn(PIN_DHT22, LOW, 120) == 0 || pulseIn(PIN_DHT22, HIGH, 120) == 0)
+    if (pulseIn(PIN_DHT22, LOW, DHT22_RESPONSE_TIMEOUT_US) == 0 ||
+        pulseIn(PIN_DHT22, HIGH, DHT22_RESPONSE_TIMEOUT_US) == 0)
     {
         return false;
     }
 
     for (uint8_t i = 0; i < 40; ++i)
     {
-        if (pulseIn(PIN_DHT22, LOW, 100) == 0)
+        if (pulseIn(PIN_DHT22, LOW, DHT22_BIT_LOW_TIMEOUT_US) == 0)
         {
             return false;
         }
 
-        uint32_t highTime = pulseIn(PIN_DHT22, HIGH, 150);
+        uint32_t highTime = pulseIn(PIN_DHT22, HIGH, DHT22_BIT_HIGH_TIMEOUT_US);
         if (highTime == 0)
         {
             return false;
