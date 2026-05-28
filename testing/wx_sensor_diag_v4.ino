@@ -7,7 +7,7 @@ static const uint8_t PIN_BMP_SDA = 48;
 static const uint8_t PIN_BMP_SCL = 47;
 static const uint8_t BMP280_ADDR_PRIMARY = 0x76;
 static const uint8_t BMP280_ADDR_SECONDARY = 0x77;
-static const uint16_t DHT22_START_LOW_MS = 2;
+static const uint16_t DHT22_START_LOW_US = 2000;
 static const uint16_t DHT22_START_HIGH_US = 40;
 static const uint8_t BMP280_CONFIG_STANDBY_1000MS = 0xA0;
 static const uint8_t BMP280_CTRL_NORMAL_X1 = 0x27;
@@ -217,7 +217,7 @@ static bool readDht22Values(float &temperatureC, float &humidityPct)
 
     pinMode(PIN_DHT22, OUTPUT);
     digitalWrite(PIN_DHT22, LOW);
-    delay(DHT22_START_LOW_MS);
+    delayMicroseconds(DHT22_START_LOW_US);
     digitalWrite(PIN_DHT22, HIGH);
     delayMicroseconds(DHT22_START_HIGH_US);
     pinMode(PIN_DHT22, INPUT_PULLUP);
