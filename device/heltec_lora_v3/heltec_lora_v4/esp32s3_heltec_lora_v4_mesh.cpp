@@ -1102,7 +1102,9 @@ static bool readDht22Values(float &temperatureC, float &humidityPct)
         }
     }
 
-    uint8_t checksum = static_cast<uint8_t>(data[0] + data[1] + data[2] + data[3]);
+    uint16_t checksumSum = static_cast<uint16_t>(data[0]) + static_cast<uint16_t>(data[1]) +
+                           static_cast<uint16_t>(data[2]) + static_cast<uint16_t>(data[3]);
+    uint8_t checksum = static_cast<uint8_t>(checksumSum & 0xFF);
     if (checksum != data[4])
     {
         return false;
