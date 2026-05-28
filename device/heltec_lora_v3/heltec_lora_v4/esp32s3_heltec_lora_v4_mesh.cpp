@@ -235,7 +235,7 @@ uint8_t bmp280Address = 0;
 
 // Dedicated I2C bus for BMP280 on pins 48/47 (separate from OLED).
 TwoWire bmpWire(1);
-Adafruit_BMP280 bmp280Sensor;
+Adafruit_BMP280 bmp280Sensor(&bmpWire);
 DHT dht22Sensor(PIN_DHT22, DHT22);
 
 // Bluetooth characteristic
@@ -888,7 +888,7 @@ static bool initBmp280Sensor()
 
     for (uint8_t address : addresses)
     {
-        if (bmp280Sensor.begin(address, BMP280_CHIPID, &bmpWire))
+        if (bmp280Sensor.begin(address, BMP280_CHIPID))
         {
             bmp280Address = address;
             break;
